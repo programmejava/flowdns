@@ -50,6 +50,7 @@ make package/myapp/flowdns-core/compile package/myapp/flowdns/compile package/my
 
 ## 文档
 
+- [当前稳定基线、备份范围与版本解锁](STABLE-BASELINE.md)
 - [故障排查](package/myapp/flowdns/TROUBLESHOOTING.md)
 - [开发过程与问题复盘](package/myapp/flowdns/DEVELOPMENT.md)
 - [功能实现记录](package/myapp/flowdns/IMPLEMENTATION.md)
