@@ -1,0 +1,934 @@
+#!/usr/bin/lua
+-- SPDX-License-Identifier: GPL-3.0-or-later
+local json = require 'luci.jsonc'
+local fs = require 'nixio.fs'
+local nixio = require 'nixio'
+-- Prefer the optional private engine without replacing other plugins' binary.
+local private_bin = '/usr/libexec/flowdns-bin'
+local current_path = os.getenv('PATH') or '/usr/sbin:/usr/bin:/sbin:/bin'
+if current_path:sub(1, #private_bin + 1) ~= private_bin .. ':' then
+	nixio.setenv('PATH', private_bin .. ':' .. current_path)
+end
+local uci = require 'uci'.cursor()
+local core = require 'flowdns.core'
+local system = require 'flowdns.system'
+local transparent = require 'flowdns.transparent'
+local RUN, DATA = '/var/run/flowdns', '/etc/flowdns'
+local running, update_rules, dns_probe, environment, health
+local bundles = { 'config.json', 'active.nft', 'active.json', 'xray.json', 'dnsmasq.conf', 'engine-mode' }
+
+local function q(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
+local function read(path) return fs.readfile(path) or '' end
+local function tail(path, size)
+	local file = io.open(path, 'r')
+	if not file then return '' end
+	local length = file:seek('end') or 0
+	file:seek('set', math.max(0, length - size))
+	local text = file:read('*a') or ''
+	file:close()
+	return text
+end
+local function decode(path) return json.parse(read(path)) end
+local write = system.write
+local function execute(cmd)
+	local p = assert(io.popen(cmd .. ' 2>&1'))
+	local output = p:read('*a')
+	p:close()
+	return output
+end
+local function run(cmd)
+	-- Each invocation captures its own output: status polling must not overwrite
+	-- an in-flight apply/update command's error report.
+	local output = execute('( ' .. cmd .. " ) 2>&1; printf '\\nFLOWDNS_EXIT=%s\\n' \"$?\"")
+	local code = output:match('\nFLOWDNS_EXIT=(%d+)\n$')
+	return code == '0', output:gsub('\nFLOWDNS_EXIT=%d+\n$', '')
+end
+local function checked(cmd, why)
+	local ok, err = run(cmd)
+	assert(ok, why .. '\n' .. err:sub(-3000))
+end
+local function list(v)
+	if type(v) == 'table' then return v end
+	return v and { v } or {}
+end
+local function first(config, kind)
+	local found
+	uci:foreach(config, kind, function(s) if not found then found = s end end)
+	return found or {}
+end
+local function runtime()
+	return decode(RUN .. '/active.json')
+end
+local function autostart()
+	return fs.access('/etc/rc.d/S99flowdns') and true or false
+end
+local function operation()
+	local owner = decode(RUN .. '/operation.json')
+	return system.alive(owner) and owner or nil
+end
+local function config()
+	local c = uci:get_all('flowdns', 'main') or {}
+	c.provider, c.transport = c.provider or 'passwall', c.transport or 'https'
+	c.mode = c.mode or 'socks'
+	c.domestic_dns, c.overseas_dns = c.domestic_dns or 'alidns', c.overseas_dns or 'cloudflare'
+	c.proxy_port, c.log_level = c.proxy_port or '1080', c.log_level or 'info'
+	c.udp = c.udp ~= '0'
+	c.networks = list(c.networks or 'lan')
+	c.local_domains = { 'lan', 'local', 'home.arpa' }
+	local dhcp = first('dhcp', 'dnsmasq')
+	c.local_dns_port = tonumber(dhcp.port or 53)
+	assert(c.local_dns_port and c.local_dns_port > 0 and c.local_dns_port <= 65535, 'dnsmasq 本地 DNS 未启用。请恢复本地解析端口。')
+	assert(c.local_dns_port ~= core.dns_port and c.local_dns_port ~= core.tproxy_port and c.local_dns_port ~= core.dns_backend_port, 'dnsmasq 端口与 FlowDNS 内部端口冲突。')
+	if dhcp.domain then c.local_domains[#c.local_domains + 1] = assert(core.domain(dhcp.domain), 'dnsmasq 本地域名无效。') end
+	c.local_domains = core.domains(c.local_domains)
+	if c.provider == 'passwall' then
+		local g = first('passwall', 'global')
+		assert(g.socks_enabled == '1', 'PassWall：请开启独立 SOCKS 服务，关闭主透明代理及访问控制。')
+		local ports = {}
+		uci:foreach('passwall', 'socks', function(s)
+			if s.enabled == '1' and s.node and s.node ~= '' then
+				assert(uci:get('passwall', s.node, 'protocol') ~= '_shunt', 'PassWall 的独立 SOCKS 服务选择了分流节点。请改用普通代理节点。')
+				ports[#ports + 1] = s.port
+			end
+		end)
+		assert(#ports == 1, 'PassWall：请保留一个启用的独立 SOCKS 服务；多个出口时请选择“手动端口”。')
+		c.proxy_port = ports[1]
+	elseif c.provider == 'ssrplus' then
+		local s = first('shadowsocksr', 'socks5_proxy')
+		assert(s.enabled == '1' and s.server and s.server ~= 'nil' and s.server ~= 'same', 'SSR Plus：请开启本地 SOCKS5，显式选择节点，主服务器选择“禁用”。')
+		assert(not s.socks5_auth or s.socks5_auth == 'noauth', 'SSR Plus → 高级设置 → SOCKS5 代理服务端（全局）：认证方式请选择 NOAUTH。')
+		c.proxy_port = s.local_port
+		if c.mode == 'transparent' then
+			assert(s.server:match('^[%w_%-]+$'), 'SSR 节点标识不合法。')
+			local node = uci:get_all('shadowsocksr', s.server) or {}
+			assert(node.type == 'v2ray', '透明代理模式目前需要 SSR Plus 的 Xray 节点；其他类型请使用 SOCKS 模式。')
+			c.ssr_node = s.server
+			c.ssr_revision = fs.stat('/etc/config/shadowsocksr', 'mtime') or 0
+		end
+	end
+	return core.validate(c)
+end
+
+local function conflicts()
+	local errors = {}
+	local function add(message) errors[#errors + 1] = message end
+	for _, app in ipairs({ 'passwall', 'passwall2' }) do
+		local g = first(app, 'global')
+		if g.enabled == '1' or g.acl_enable == '1' then add(app .. ' 的透明代理或访问控制仍开启。请只保留独立 SOCKS 出口。') end
+	end
+	local ssr = first('shadowsocksr', 'global')
+	if ssr.global_server and ssr.global_server ~= 'nil' and ssr.global_server ~= '' then
+		add('SSR Plus 主透明代理仍开启。请将主服务器设为“禁用”，保留本地 SOCKS5 节点。')
+	end
+	local adg = first('AdGuardHome', 'AdGuardHome')
+	if adg.enabled == '1' and adg.redirect and adg.redirect ~= 'none' then add('AdGuardHome 正在接管 DNS。请关闭其重定向/端口交换。') end
+	local dns = first('smartdns', 'smartdns')
+	if dns.enabled == '1' and (dns.redirect == '1' or dns.auto_set_dnsmasq == '1' or dns.port == '53') then
+		add('SmartDNS 正在接管 DNS。请先关闭 SmartDNS 的 DNS 接管。')
+	end
+	local fw = execute('nft -t list ruleset'):lower()
+	if fw:find('ss_spec', 1, true) then
+		add('防火墙仍有 SSR Plus 的 ss_spec / ss_spec_mangle 规则；退出主透明代理后遗留的重定向会抢走 FlowDNS 连接。请清理 SSR 遗留规则后再应用；FlowDNS 不会自动删除其他插件的规则表。')
+	elseif fw:find('passwall', 1, true) or fw:match('ssr[-_]') or fw:match('psw[_2]') then
+		add('防火墙仍有 PassWall / SSR 的规则。请重启对应代理插件，确认已退出透明代理模式。')
+	end
+	return errors
+end
+
+local function devices(c)
+	local out, seen = {}, {}
+	assert(#c.networks > 0, '请至少选择一个 LAN 网络。')
+	for _, name in ipairs(c.networks) do
+		assert(name:match('^[%w_]+$'), '网络名称不合法。')
+		assert(name ~= 'wan' and name ~= 'wan6' and name ~= 'loopback', '只允许接管 LAN 网络。')
+		local s = json.parse(execute('ubus call ' .. q('network.interface.' .. name) .. ' status')) or {}
+		assert(s.up and s.l3_device, '网络 ' .. name .. ' 尚未就绪。')
+		local trusted = false
+		uci:foreach('firewall', 'zone', function(z)
+			for _, n in ipairs(list(z.network)) do if n == name and z.input == 'ACCEPT' then trusted = true end end
+		end)
+		assert(trusted, '网络 ' .. name .. ' 必须属于 input=ACCEPT 的受信任 LAN 防火墙区域。')
+		if not seen[s.l3_device] then out[#out + 1], seen[s.l3_device] = s.l3_device, true end
+	end
+	return out
+end
+
+local function ruleset()
+	local path = fs.realpath(DATA .. '/rules/current')
+	assert(path and path:match('^/etc/flowdns/rules/v[%d%-]+$'), '尚未初始化规则。请点击“更新国内规则”，成功后再启用。')
+	local r = assert(decode(path .. '/manifest.json'), '规则清单损坏，请重新更新规则。')
+	assert((r.domain_count or 0) >= 100, '国内域名规则不足，请重新更新。')
+	return r, path
+end
+
+local function compile_rules(path)
+	for _, name in ipairs({ 'domains', 'ip' }) do
+		local dest = path .. '/' .. name .. '.srs'
+		if not fs.access(dest) then
+			checked('sing-box rule-set compile --output ' .. q(dest .. '.tmp') .. ' ' .. q(path .. '/' .. name .. '.json'), '规则编译失败：')
+			assert(fs.rename(dest .. '.tmp', dest), '无法保存二进制规则。')
+		end
+	end
+end
+
+local function listening(port, any, pid)
+	local target, tcp, udp = (':%04X'):format(port), false, false
+	local sockets = {}
+	if pid then
+		local entries = fs.dir('/proc/' .. pid .. '/fd')
+		if not entries then return false end
+		for fd in entries do
+			local inode = (fs.readlink('/proc/' .. pid .. '/fd/' .. fd) or ''):match('^socket:%[(%d+)%]$')
+			if inode then sockets[inode] = true end
+		end
+	end
+	for _, proto in ipairs({ 'tcp', 'tcp6', 'udp', 'udp6' }) do
+		for line in read('/proc/net/' .. proto):gmatch('[^\n]+') do
+			local addr, state = line:match('^%s*%d+:%s+(%S+)%s+%S+%s+(%x+)')
+			local fields = {}; if pid then for field in line:gmatch('%S+') do fields[#fields + 1] = field end end
+			if addr and addr:sub(-5) == target and (not pid or sockets[fields[10]]) then
+				if proto:sub(1, 3) == 'tcp' and state == '0A' then tcp = true end
+				if proto:sub(1, 3) == 'udp' and state == '07' then udp = true end
+			end
+		end
+	end
+	return any and (tcp or udp) or (tcp and udp)
+end
+
+local function pidfile(name)
+	local pid = tonumber(read(RUN .. '/' .. name .. '.pid'):match('^%s*(%d+)'))
+	return pid and pid > 1 and nixio.kill(pid, 0) and pid or nil
+end
+local function core_ready()
+	local pid = system.core_pid(RUN)
+	if not pid then return false end
+	if (runtime() or {}).mode == 'transparent' then
+		local dns, front, proxy = pidfile('dns'), pidfile('front'), pidfile('transparent')
+		local c = runtime()
+		return dns and front and proxy and listening(core.dns_backend_port, false, dns)
+			and listening(core.dns_port, false, front) and listening(core.tproxy_port, not c.udp, proxy) or false
+	end
+	return listening(core.dns_port, false, pid) and listening(core.tproxy_port, false, pid) or false
+end
+local function port_available(port)
+	if not listening(port, true) then return true end
+	for _, name in ipairs({ 'core', 'dns', 'front', 'transparent' }) do
+		local pid = pidfile(name)
+		if pid and listening(port, true, pid) then return true end
+	end
+	return false
+end
+
+local function socks(port, udp)
+	local s = nixio.socket('inet', 'stream')
+	if not s then return false, '无法创建本地检测连接。' end
+	s:setopt('socket', 'rcvtimeo', 3)
+	s:setopt('socket', 'sndtimeo', 3)
+	local function recv(n)
+		local data = ''
+		while #data < n do
+			local chunk = s:recv(n - #data)
+			if not chunk or chunk == '' then return nil end
+			data = data .. chunk
+		end
+		return data
+	end
+	local ok, message = false, '本地端口不可达，或不是无需认证的 SOCKS5 服务。'
+	if s:connect('127.0.0.1', port) then
+		s:send('\5\1\0')
+		if recv(2) == '\5\0' then
+			ok, message = true, 'SOCKS5 握手成功；完整出口可用性由国外 DoH/DoT 检测验证。'
+			if udp then
+				s:send('\5\3\0\1\0\0\0\0\0\0')
+				local reply = recv(4)
+				ok = reply and reply:byte(1) == 5 and reply:byte(2) == 0 or false
+				message = ok and 'UDP ASSOCIATE 被接受；仍需真机验证实际 UDP 转发。' or 'SOCKS5 出口不支持 UDP ASSOCIATE，请更换节点/核心，或在高级设置关闭代理 UDP。'
+			end
+		end
+	end
+	s:close()
+	return ok, message
+end
+
+local function prepare(offline)
+	local started = system.now()
+	local c = config()
+	local env = environment()
+	assert(env.ok, env.message)
+	local errors = conflicts()
+	assert(#errors == 0, table.concat(errors, '\n'))
+	assert(port_available(core.dns_port), 'DNS 端口 ' .. core.dns_port .. ' 已被其他进程占用。')
+	assert(port_available(core.tproxy_port), '透明转接端口 ' .. core.tproxy_port .. ' 已被其他进程占用。')
+	if c.mode == 'transparent' then assert(port_available(core.dns_backend_port), '内部 DNS 端口 16554 被其他进程占用。') end
+	assert(os.time() >= 1735689600, '路由器时间不正确，请先同步时间，以便验证 DNS 的 TLS 证书。')
+	if not offline then
+		local ok, why = socks(c.proxy_port, false)
+		assert(ok, why)
+		if c.udp and c.mode ~= 'transparent' then ok, why = socks(c.proxy_port, true); assert(ok, why) end
+	end
+	local r, path = ruleset()
+	compile_rules(path)
+	c.binary_rules = true
+	local selected = decode(RUN .. '/dns-selection.json') or {}
+	if selected.domestic_primary == c.domestic_dns and selected.overseas_primary == c.overseas_dns and c.dns_failover then
+		c.domestic_active = (selected.domestic or {}).active
+		c.overseas_active = (selected.overseas or {}).active
+	end
+	c.devices, c.rules_path, c.rules_version = devices(c), path, r.version
+	local cfg = core.config(c, path)
+	write(RUN .. '/candidate.json', cfg)
+	checked('sing-box check -c ' .. q(RUN .. '/candidate.json'), 'sing-box 配置检查失败：')
+	local nft = core.firewall(c.devices)
+	write(RUN .. '/candidate-xray.json', '')
+	write(RUN .. '/candidate-dnsmasq.conf', '')
+	if c.mode == 'transparent' then
+		assert(fs.access('/usr/share/shadowsocksr/gen_config.lua'), '未找到 SSR Plus 的 Xray 配置生成器。')
+		local yes, features = run('/usr/libexec/flowdns-dns --version')
+		assert(yes and features:match('%Wnftset%W') and not features:find('no%-nftset'), '私有 DNS 前端缺失或不支持 nftset，请完整升级 FlowDNS 服务包。')
+		local generated, output = run('lua /usr/share/shadowsocksr/gen_config.lua ' .. q(c.ssr_node) .. ' ' .. q(c.udp and 'tcp,udp' or 'tcp') .. ' 15355 0')
+		assert(generated, 'SSR Xray 配置生成失败：' .. output:sub(-1000))
+		write(RUN .. '/candidate-xray.json', transparent.xray(c, assert(json.parse(output), 'SSR 配置生成结果不是 JSON。')))
+		checked('xray run -test -config ' .. q(RUN .. '/candidate-xray.json'), 'Xray 配置检查失败：')
+		local policy = assert(decode(path .. '/policy.json'), '国内域名数据损坏。')
+		local ips = assert(decode(path .. '/ip.json'), '国内 IP 数据损坏。')
+		write(RUN .. '/candidate-dnsmasq.conf', transparent.dnsmasq(c, policy.domains))
+		checked('/usr/libexec/flowdns-dns --test --conf-file=' .. q(RUN .. '/candidate-dnsmasq.conf'), '独立 DNS 前端配置检查失败：')
+		nft = transparent.firewall(c, assert((ips.rules or {})[1]).ip_cidr, core)
+	end
+	write(RUN .. '/candidate.nft', nft)
+	-- Validate as an atomic replacement; never remove a live table just to check it.
+	local exists = run('nft -t list table inet flowdns')
+	write(RUN .. '/check.nft', (exists and 'delete table inet flowdns\n' or '') .. read(RUN .. '/candidate.nft'))
+	checked('nft -c -f ' .. q(RUN .. '/check.nft'), '防火墙规则检查失败：')
+	write(RUN .. '/candidate-policy.json', c)
+	write(RUN .. '/timing.json', { prepared_seconds = system.now() - started, time = os.time() })
+	return { ok = true, message = '配置、代理接口及规则检查通过。' }
+end
+
+local function policy_route(family, install)
+	local prefix = 'ip -' .. family .. ' '
+	local label = 'IPv' .. family
+	local function inspect(command, what)
+		local ok, output = run('ip -N -j -' .. family .. ' ' .. command)
+		assert(ok, label .. ' ' .. what .. '读取失败：\n' .. output:sub(-2000))
+		local value = json.parse(output)
+		assert(type(value) == 'table', label .. ' ' .. what .. '未返回 JSON，请检查 ip-full：\n' .. output:sub(-2000))
+		return value
+	end
+	local own_count = 0
+	for _, rule in ipairs(inspect('rule show', '策略规则')) do
+		if tonumber(rule.priority) == core.table_id then
+			local owned = core.owns_rule(rule)
+			assert(owned or not install, label .. ' 策略路由优先级 20260 已被其他软件占用：\n' .. json.stringify(rule))
+			if owned then own_count = own_count + 1 end
+		end
+	end
+	-- Querying an absent table can emit only "Dump terminated" on OpenWrt.
+	-- The all-table dump has no absent-table error; filter numeric IDs ourselves.
+	local routes = {}
+	for _, route in ipairs(inspect('route show table all', '路由表')) do
+		if tonumber(route.table) == core.table_id then routes[#routes + 1] = route end
+	end
+	local owned = own_count > 0 or fs.access(RUN .. '/route-' .. family)
+	local own_route = #routes == 1 and core.owns_route(routes[1])
+	if install then
+		assert(#routes == 0 or (owned and own_route), label .. ' 路由表 20260 已被其他软件占用：\n' .. json.stringify(routes))
+		checked(prefix .. 'route replace local default dev lo table 20260', '添加本地策略路由失败：')
+		write(RUN .. '/route-' .. family, 'owned')
+		if own_count == 0 then checked(prefix .. 'rule add pref 20260 fwmark 0x40000000/0x40000000 lookup 20260', '添加分流标记规则失败：') end
+	elseif owned then
+		for _ = 1, own_count do run(prefix .. 'rule del pref 20260 fwmark 0x40000000/0x40000000 lookup 20260') end
+		-- A stale ownership marker must never authorize deleting a foreign route.
+		if own_route then run(prefix .. 'route del local default dev lo table 20260') end
+		fs.unlink(RUN .. '/route-' .. family)
+	end
+end
+
+local function detach()
+	run('nft delete table inet flowdns')
+	for _, family in ipairs({ 4, 6 }) do pcall(policy_route, family, false) end
+	fs.unlink(RUN .. '/attached')
+	return { ok = true }
+end
+
+local function attach()
+	assert(core_ready(), '本次核心的 DNS 或流量转接监听尚未就绪。')
+	local errors = conflicts()
+	assert(#errors == 0, table.concat(errors, '\n'))
+	policy_route(4, true)
+	policy_route(6, true)
+	local exists = run('nft -t list table inet flowdns')
+	write(RUN .. '/install.nft', (exists and 'delete table inet flowdns\n' or '') .. read(RUN .. '/active.nft'))
+	checked('nft -f ' .. q(RUN .. '/install.nft'), '应用防火墙规则失败：')
+	write(RUN .. '/attached', tostring(os.time()))
+	return { ok = true }
+end
+
+local function activate()
+	for _, name in ipairs(bundles) do
+		if fs.access(RUN .. '/' .. name) then write(RUN .. '/previous-' .. name, read(RUN .. '/' .. name)) end
+	end
+	write(RUN .. '/config.json', read(RUN .. '/candidate.json'))
+	write(RUN .. '/active.nft', read(RUN .. '/candidate.nft'))
+	write(RUN .. '/active.json', read(RUN .. '/candidate-policy.json'))
+	write(RUN .. '/xray.json', read(RUN .. '/candidate-xray.json'))
+	write(RUN .. '/dnsmasq.conf', read(RUN .. '/candidate-dnsmasq.conf'))
+	write(RUN .. '/engine-mode', (decode(RUN .. '/candidate-policy.json') or {}).mode or 'socks')
+end
+
+running = function()
+	local data = json.parse(execute("ubus call service list '{\"name\":\"flowdns\"}'")) or {}
+	for _, s in pairs((data.flowdns or {}).instances or {}) do if s.running then return true end end
+	return false
+end
+
+local function setup(c, rules)
+	local steps = {}
+	local function add(id, title, ready, detail, link)
+		steps[#steps + 1] = { id = id, title = title, ready = ready and true or false, detail = detail, link = link }
+	end
+	if c.provider == 'ssrplus' then
+		local g, s = first('shadowsocksr', 'global'), first('shadowsocksr', 'socks5_proxy')
+		local mode = not g.global_server or g.global_server == 'nil' or g.global_server == ''
+		local socks_ready = s.enabled == '1' and s.server and s.server ~= 'nil' and s.server ~= 'same'
+			and (not s.socks5_auth or s.socks5_auth == 'noauth') and (tonumber(s.local_port) or 0) > 0
+		add('proxy-endpoint', 'SSR Plus 提供本地 SOCKS5', socks_ready,
+			'SSR Plus → 高级设置 → SOCKS5 代理服务端（全局）：启用，服务器选择实际节点（不要选“与全局服务器相同”），认证 NOAUTH，本地端口 1080，保存应用。', 'ssr_advanced')
+		add('proxy-mode', 'SSR Plus 退出透明代理', mode,
+			'SSR Plus → 客户端设置：将“主服务器”设为“禁用”，保存应用。节点仍在高级设置中供本地 SOCKS5 使用。', 'ssr_client')
+	elseif c.provider == 'passwall' then
+		local g, count = first('passwall', 'global'), 0
+		uci:foreach('passwall', 'socks', function(s)
+			if s.enabled == '1' and s.node and s.node ~= '' and uci:get('passwall', s.node, 'protocol') ~= '_shunt' then count = count + 1 end
+		end)
+		add('proxy-mode', 'PassWall 退出透明代理', g.enabled ~= '1' and g.acl_enable ~= '1', '关闭 PassWall 主透明代理和访问控制。', 'passwall')
+		add('proxy-endpoint', 'PassWall 提供独立 SOCKS5', g.socks_enabled == '1' and count == 1, '启用一个独立 SOCKS 服务，选择普通代理节点，绑定本机。', 'passwall')
+	else
+		local port = tonumber(c.proxy_port or 1080)
+		add('proxy-endpoint', '本地 SOCKS5 出口', port and port > 0 and port <= 65535, '在高级设置填写本机 SOCKS5 端口，并关闭其他插件的透明代理。保存时会进行实际握手检测。')
+	end
+	add('rules', '国内规则', (rules.domain_count or 0) >= 100,
+		'首次启用并保存应用时自动下载国内域名及 IPv4/IPv6 规则；也可以手动点击“更新国内规则”。')
+	return steps
+end
+
+local function status()
+	local c = uci:get_all('flowdns', 'main') or {}
+	local rules = decode(DATA .. '/rules/current/manifest.json') or {}
+	local alive = running()
+	local state = read(RUN .. '/state'):match('%S+')
+	local ready = alive and (state == 'ready' or state == 'degraded') and core_ready()
+	local recovery = tail(RUN .. '/recovery.log', 4000)
+	return { version = '1.0.1', dns_updating = fs.access(RUN .. '/dns-reload.request') and true or false, mode = c.mode or 'socks', enabled = c.enabled == '1', autostart = autostart(), running = ready, starting = alive and (state == 'starting' or state == 'waiting' or state == 'recovering'),
+		supervised = alive, state = state, dns_ready = alive and listening(core.dns_port),
+		attached = run('nft -t list table inet flowdns') and true or false,
+		active = ready and fs.access(RUN .. '/attached') and runtime() or nil, setup = setup(c, rules), rules_version = rules.version, domain_count = rules.domain_count or 0,
+		job = system.job(RUN), operation = operation(), dns_switch = decode(RUN .. '/dns-switch.json'), checks = decode(RUN .. '/checks.json'), rules = rules,
+		health = decode(RUN .. '/health.json'), timing = decode(RUN .. '/timing.json'),
+		metrics = decode(RUN .. '/metrics.json'), environment = decode(RUN .. '/environment.json'),
+		update = decode(RUN .. '/update.json'), waiting = read(RUN .. '/waiting'),
+		recent_errors = (recovery ~= '' and (recovery .. '\n') or '') .. tail(RUN .. '/core.log', 16000):gsub('[^\n]*\n', function(line) return (line:find('ERROR', 1, true) or line:find('FATAL', 1, true) or line:find('WARN', 1, true)) and line or '' end),
+		error = read(RUN .. '/error'), log = tail(RUN .. '/core.log', 12000) .. ((runtime() or {}).mode == 'transparent' and ('\n--- Xray ---\n' .. tail(RUN .. '/xray.log', 12000) .. '\n--- DNS 前端 ---\n' .. tail(RUN .. '/dnsmasq.log', 3000)) or ''), startup_log = tail(RUN .. '/startup.log', 6000), dns_reload_log = tail(RUN .. '/dns-reload.log', 4000),
+		firewall = execute('nft -t list table inet flowdns'):sub(-12000) }
+end
+
+local SOURCES = {
+	domains = 'https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf',
+	ipv4 = 'https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china.txt',
+	ipv6 = 'https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china6.txt'
+}
+local function publish(target, link)
+	fs.unlink(link .. '.new')
+	assert(fs.symlink(target, link .. '.new'), '无法建立规则版本链接。')
+	assert(fs.rename(link .. '.new', link), '无法切换规则版本。')
+end
+update_rules = function()
+	local proxy = ''
+	local ok, c = pcall(config)
+	if ok and socks(c.proxy_port, false) then proxy = ' --proxy ' .. q('socks5h://127.0.0.1:' .. c.proxy_port) end
+	for name, url in pairs(SOURCES) do
+		checked('curl --fail --silent --show-error --location --proto =https --proto-redir =https --connect-timeout 5 --max-time 20 --max-filesize 8388608' .. proxy .. ' --output ' .. q(RUN .. '/' .. name .. '.download') .. ' ' .. q(url), '下载 ' .. name .. ' 规则失败；请检查代理出口和系统时间：')
+	end
+	local domains = core.parse_china(read(RUN .. '/domains.download'))
+	local ipv4 = core.parse_cidrs(read(RUN .. '/ipv4.download'), 4)
+	local ipv6 = core.parse_cidrs(read(RUN .. '/ipv6.download'), 6)
+	assert(#domains >= 100 and #ipv4 >= 100 and #ipv6 >= 10, '规则数量异常，保留原有版本。')
+	local old_manifest = decode(DATA .. '/rules/current/manifest.json') or {}
+	local manifest = { version = os.date('!%Y%m%d%H%M%S') .. '-' .. nixio.getpid(), updated = os.time(),
+		domain_count = #domains, ipv4_count = #ipv4, ipv6_count = #ipv6, sources = SOURCES }
+	manifest.changes = core.rule_change(old_manifest, manifest)
+	local version = manifest.version
+	local path = DATA .. '/rules/v' .. version
+	assert(fs.mkdirr(path), '无法创建规则目录。')
+	local ips = {}
+	for _, group in ipairs({ ipv4, ipv6 }) do for _, ip in ipairs(group) do ips[#ips + 1] = ip end end
+	write(path .. '/policy.json', { version = version, domains = domains, sources = SOURCES, ipv4_count = #ipv4, ipv6_count = #ipv6 })
+	write(path .. '/manifest.json', manifest)
+	write(path .. '/domains.json', { version = 3, rules = { { domain_suffix = domains } } })
+	write(path .. '/ip.json', { version = 3, rules = { { ip_cidr = ips } } })
+	compile_rules(path)
+	local old = fs.realpath(DATA .. '/rules/current')
+	if old then publish(old, DATA .. '/rules/previous') end
+	publish(path, DATA .. '/rules/current')
+	-- Keep both published versions and any versions still referenced by running
+	-- or recoverable configurations. Updates must not fill the router's flash.
+	local keep = { [path] = true }
+	if old then keep[old] = true end
+	for _, name in ipairs({ 'active.json', 'previous-active.json' }) do
+		local saved = decode(RUN .. '/' .. name)
+		if saved and saved.rules_path then keep[saved.rules_path] = true end
+	end
+	for name in fs.dir(DATA .. '/rules') do
+		local dir = DATA .. '/rules/' .. name
+		if name:match('^v[%d%-]+$') and not keep[dir] then
+			for _, file in ipairs({ 'policy.json', 'manifest.json', 'domains.json', 'ip.json', 'domains.srs', 'ip.srs' }) do fs.unlink(dir .. '/' .. file) end
+			fs.rmdir(dir)
+		end
+	end
+	return { ok = true, message = '国内规则已更新，请点击“保存并应用”使新规则生效。', version = version, domains = #domains }
+end
+
+dns_probe = function(c, overseas, provider)
+	local p = core.providers[provider or (overseas and c.overseas_dns or c.domestic_dns)]
+	local domain = overseas and 'www.google.com' or 'www.qq.com'
+	local labels = {}
+	for label in domain:gmatch('[^.]+') do labels[#labels + 1] = string.char(#label) .. label end
+	local packet = '\70\68\1\0\0\1\0\0\0\0\0\0' .. table.concat(labels) .. '\0\0\1\0\1'
+	write(RUN .. '/probe.query', packet)
+	if c.transport == 'https' then
+		local name = p.https_name or p.name
+		local proxy = overseas and (' --proxy ' .. q('socks5://127.0.0.1:' .. c.proxy_port)) or ' --noproxy "*"'
+		local ok, err = run('curl --fail --silent --show-error --connect-timeout 3 --max-time 8' .. proxy ..
+			' --connect-to ' .. q(name .. ':443:' .. p.ip .. ':443') .. ' --header "Content-Type: application/dns-message" --header "Accept: application/dns-message" --data-binary ' .. q('@' .. RUN .. '/probe.query') .. ' --output ' .. q(RUN .. '/probe.reply') .. ' ' .. q('https://' .. name .. '/dns-query'))
+		if not ok then return false, err:sub(-1500) end
+		local reply = read(RUN .. '/probe.reply')
+		local valid = #reply >= 12 and reply:sub(1, 2) == packet:sub(1, 2) and reply:byte(3) >= 128 and reply:byte(4) % 16 == 0 and (reply:byte(7) * 256 + reply:byte(8)) > 0
+		return valid, valid and 'TLS 证书与 DNS 应答验证通过。' or 'HTTP 成功，但没有收到有效的 DNS 地址应答。'
+	end
+	-- A short-lived, isolated sing-box instance performs a real DoT query using
+	-- exactly the same transport, certificate checks and SOCKS detour as production.
+	assert(not listening(15356), '诊断端口 15356 被占用。')
+	local probe = {
+		log = { level = 'info', output = RUN .. '/probe.log' },
+		dns = { servers = { core.dns_server(c, provider or (overseas and c.overseas_dns or c.domestic_dns), 'probe', overseas) }, final = 'probe' },
+		inbounds = { { type = 'direct', tag = 'probe-in', listen = '127.0.0.1', listen_port = 15356 } },
+		outbounds = { { type = 'direct', tag = 'direct' }, { type = 'socks', tag = 'proxy', server = '127.0.0.1', server_port = c.proxy_port, version = '5' } },
+		route = { rules = { { inbound = { 'probe-in' }, action = 'hijack-dns' } }, final = 'direct' }
+	}
+	write(RUN .. '/probe.json', probe)
+	write(RUN .. '/probe.log', '')
+	local pid = tonumber(execute('timeout 12 sing-box run -c ' .. q(RUN .. '/probe.json') .. ' >' .. q(RUN .. '/probe-launch.log') .. ' 2>&1 </dev/null & echo $!'))
+	if not pid then return false, '无法启动 DoT 检测进程。' end
+	for _ = 1, 10 do
+		if listening(15356) then break end
+		nixio.nanosleep(0, 100000000)
+	end
+	local sock = nixio.socket('inet', 'dgram')
+	local reply
+	if sock then
+		sock:setopt('socket', 'rcvtimeo', 8)
+		if sock:connect('127.0.0.1', 15356) then sock:send(packet); reply = sock:recv(4096) end
+		sock:close()
+	end
+	os.execute('kill ' .. pid .. ' 2>/dev/null')
+	local valid = reply and #reply >= 12 and reply:sub(1, 2) == packet:sub(1, 2) and reply:byte(3) >= 128 and reply:byte(4) % 16 == 0 and (reply:byte(7) * 256 + reply:byte(8)) > 0
+	return valid and true or false, valid and 'DoT 实际查询成功，证书验证通过。' or ('DoT 查询失败：\n' .. read(RUN .. '/probe-launch.log'):sub(-1000) .. read(RUN .. '/probe.log'):sub(-1500))
+end
+
+local function diagnose()
+	local checks = {}
+	local function add(name, ok, detail)
+		checks[#checks + 1] = { name = name, state = ok == nil and 'warning' or ok and 'ok' or 'error', detail = detail }
+		write(RUN .. '/checks.json', { time = os.time(), items = checks })
+	end
+	local ok, c = pcall(config)
+	add('配置与代理插件模式', ok, ok and '已读取代理入口及有效配置。' or tostring(c))
+	local registered = autostart()
+	add('开机自启动', registered and true or nil, registered and (uci:get('flowdns', 'main', 'enabled') == '1'
+		and '已注册开机服务且启用统一分流；重启后将等待网络、时间和代理出口就绪。'
+		or '已注册开机服务，但统一分流未启用；重启后不会接管。')
+		or '未注册开机服务。需要自启动时，在路由器执行 /etc/init.d/flowdns enable。')
+	local ready = running() and core_ready()
+	local active = ready and runtime() or nil
+	if active then
+		c, ok = active, true
+		add('诊断范围', true, 'DNS 和出口探测使用当前运行配置；已保存设置是否有效由上一项单独检查。')
+	else
+		add('诊断范围', nil, '核心尚未就绪；DNS 和出口探测使用已保存配置，不代表正式接管已生效。')
+	end
+	local errors = conflicts()
+	add('接管冲突', #errors == 0, #errors == 0 and '未发现已知插件的重复接管。' or table.concat(errors, '\n'))
+	local rok, r = pcall(ruleset)
+	add('国内规则', rok, rok and ('域名数：' .. r.domain_count .. '；版本：' .. r.version) or tostring(r))
+	add('系统时间', os.time() >= 1735689600, os.date('%Y-%m-%d %H:%M:%S') .. '；时间错误会导致 TLS 证书验证失败。')
+	if ok then
+		local yes, detail = socks(c.proxy_port, false); add('本地 SOCKS5', yes, detail)
+		if c.udp and c.mode ~= 'transparent' then yes, detail = socks(c.proxy_port, true); add('代理 UDP 接口', yes, detail) end
+		yes, detail = dns_probe(c, false); add('国内加密 DNS', yes, detail)
+		yes, detail = dns_probe(c, true); add('国外加密 DNS及代理出口', yes, detail)
+	end
+	add('核心监听', ready, ready and '本次核心的 DNS 和透明转接 TCP/UDP 监听均已就绪。' or ('需启用服务后检查；DNS ' .. core.dns_port .. '、透明转接 ' .. core.tproxy_port .. '，均需属于本次核心的 TCP/UDP 监听。'))
+	if ready then
+		for _, tcp in ipairs({ false, true }) do
+			for _, item in ipairs({ { '国内', 'www.qq.com' }, { active and active.mode == 'transparent' and '国外真实 IP' or '国外 Fake-IP', 'www.google.com' } }) do
+				local yes, detail = system.query(core.dns_port, item[2], tcp)
+				add('正式核心 ' .. (tcp and 'TCP ' or 'UDP ') .. item[1], yes, detail)
+			end
+		end
+	end
+	if active and active.mode == 'transparent' then
+		add('透明核心模式', true, '业务流量直接进入 Xray；sing-box/SOCKS 仅用于 DNS。DNS 返回真实 IP；共享 IP 采用代理优先，切换模式后需清理客户端 DNS 缓存。')
+		add('代理 QUIC 策略', true, not active.udp and '代理 UDP 已关闭。' or ((active.quic_effective == 'reject' and '在代理分支提前拒绝 UDP/443；国内直连及其它 UDP 保持原策略。' or '允许代理 UDP/443，仍需实际验证节点支持。') .. (active.quic_reason or '')))
+		local sw=decode(RUN .. '/dns-switch.json')
+		if sw then
+			local level=sw.state == 'done'
+			if sw.state == 'rolled-back' then level=nil end
+			add('最近 DNS 更新',level,(sw.message or '') .. ' 原因：' .. (sw.reason or '') .. '；耗时 ' .. tostring(sw.elapsed_ms or 0) .. ' 毫秒。')
+		end
+		add('实际视频和 UDP 吞吐', nil, '监听与 DNS 通过不代表视频吞吐通过。请保持同一节点、同一视频和画质做对照；UDP/QUIC 需实际客户端验证。')
+	end
+	local env = environment()
+	local env_state = env.ok
+	if env.ok and #env.warnings > 0 then env_state = nil end
+	add('运行环境', env_state, env.message)
+	add('客户端验证', nil, '电脑使用系统 DNS 后运行 nslookup www.qq.com 路由器IP 和 nslookup www.google.com 路由器IP，再测试网页；路由器自检不代表浏览器或实际 UDP 应用一定正常。')
+	local attached = run('nft -t list table inet flowdns')
+	add('防火墙接管', attached, attached and 'FlowDNS 独立规则表存在；实际命中请查看下方计数器。' or '未接管。启用后应出现 FlowDNS 规则表。')
+	local failures = 0
+	for _, item in ipairs(checks) do if item.state == 'error' then failures = failures + 1 end end
+	return { ok = failures == 0, message = failures == 0 and '诊断完成，各项检查通过。' or ('诊断发现 ' .. failures .. ' 项问题，请查看“逐项诊断”中的修复说明。') }
+end
+
+local function explain(name)
+	local c = running() and core_ready() and runtime() or nil
+	local scope = c and '正在运行的配置' or '已保存但未运行的配置'
+	if not c then c = config() end
+	local r = assert(decode((c.rules_path or DATA .. '/rules/current') .. '/policy.json'), '请先更新国内规则。')
+	local result = core.classify(c, r, name)
+	result.scope, result.transport, result.rules_version = scope, c.transport, r.version
+	result.note = result.note or '这是策略预判；实际连接请查看核心日志。应用内置加密 DNS 时，可能无法使用域名策略。'
+	return result
+end
+
+environment = function()
+	local cached = decode(RUN .. '/environment.json')
+	-- Ignore r1's cached version rejection immediately after upgrading.
+	if cached and cached.schema == 2 and os.time() - (cached.time or 0) < 60 then return cached end
+	local versions, problems, warnings = {}, {}, {}
+	for name, command in pairs({ sing_box = 'sing-box version', ip = 'ip -Version', nft = 'nft --version', curl = 'curl --version', timeout = 'command -v timeout' }) do
+		local ok, output = run(command)
+		versions[name] = output:match('[^\n]+') or ''
+		if not ok then problems[#problems + 1] = name .. ' 不可用：' .. output:sub(-300) end
+	end
+	local verified = versions.sing_box:match('^sing%-box version 1%.12%.25%s*$') ~= nil
+	if not verified then
+		warnings[#warnings + 1] = '检测到 ' .. (versions.sing_box ~= '' and versions.sing_box or 'sing-box 版本未知') .. '；本地回归版本为 1.12.25。版本差异仅作提示，启动仍须通过实际配置校验及本次核心监听检查。'
+	end
+	if not fs.access('/sbin/fw4') then problems[#problems + 1] = '需要 firewall4（/sbin/fw4）。' end
+	if not fs.access('/proc/net/tcp6') then problems[#problems + 1] = '需要 IPv6 内核支持。' end
+	local message = #problems == 0 and '基础依赖检查通过；内核接管能力由 nft 配置检查及正式接管验证。' or table.concat(problems, '\n')
+	if #warnings > 0 then message = message .. '\n' .. table.concat(warnings, '\n') end
+	local result = { schema = 2, ok = #problems == 0, time = os.time(), architecture = execute('uname -m'):match('%S+'),
+		versions = versions, warnings = warnings, version_verified = verified, message = message }
+	write(RUN .. '/environment.json', result)
+	return result
+end
+
+health = function()
+	local c = runtime()
+	if not c then return { ok = false, message = '尚无运行配置。' } end
+	local old = decode(RUN .. '/dns-selection.json') or {}
+	if old.domestic_primary ~= c.domestic_dns or old.overseas_primary ~= c.overseas_dns then old = {} end
+	local selection = { domestic_primary = c.domestic_dns, overseas_primary = c.overseas_dns }
+	local result = { time = os.time(), proxy = socks(c.proxy_port, false), groups = {} }
+	local changed, all_ok = false, result.proxy
+	for _, group in ipairs({ 'domestic', 'overseas' }) do
+		local overseas = group == 'overseas'
+		local primary = c[group .. '_dns']
+		local active = c[group .. '_active'] or primary
+		local started = system.now()
+		local ok, detail = false, 'SOCKS 出口不可用，国外解析保持经代理，不改为直连。'
+		if not overseas or result.proxy then ok, detail = dns_probe(c, overseas, active) end
+		local primary_ok = active == primary and ok
+		local backup_ok = active ~= primary and ok
+		local previous = old[group] or {}
+		if c.dns_failover and (not overseas or result.proxy) then
+			if active ~= primary then primary_ok = dns_probe(c, overseas, primary)
+			elseif not ok and (previous.failures or 0) >= 1 then backup_ok = dns_probe(c, overseas, core.backup(primary)) end
+		end
+		selection[group] = core.dns_health(previous, primary, active, ok, primary_ok, backup_ok, os.time(), c.dns_failover)
+		changed = changed or selection[group].active ~= active
+		result.groups[group] = { ok = ok, primary = primary, active = active, selected = selection[group].active,
+			detail = detail, elapsed_ms = math.floor((system.now() - started) * 1000), failures = selection[group].failures }
+		all_ok = all_ok and ok
+	end
+	write(RUN .. '/dns-selection.json', selection)
+	result.ok, result.reload = all_ok and true or false, changed
+	result.message = all_ok and '出口和国内外加密 DNS 正常。' or '部分链路异常；国内服务继续运行，国外不自动回退直连。'
+	write(RUN .. '/health.json', result)
+	if running() and fs.access(RUN .. '/attached') then write(RUN .. '/state', all_ok and 'ready' or 'degraded') end
+	if changed then write(RUN .. '/reload-needed', os.time()) end
+	return result
+end
+
+local function sample()
+	local before = system.metrics(); nixio.nanosleep(5); local after = system.metrics()
+	local total = math.max(1, ((after.cpus.cpu or {}).total or 0) - ((before.cpus.cpu or {}).total or 0))
+	local ncpu = 0; for name in pairs(after.cpus) do if name ~= 'cpu' then ncpu = ncpu + 1 end end
+	for name, cpu in pairs(after.cpus) do
+		local old = before.cpus[name] or cpu
+		local delta = cpu.total - old.total
+		cpu.busy_percent = delta > 0 and math.floor(1000 * (1 - (cpu.idle - old.idle) / delta)) / 10 or 0
+	end
+	for _, p in ipairs(after.processes) do
+		for _, old in ipairs(before.processes) do
+			if p.pid == old.pid and p.start == old.start then p.cpu_percent = math.floor(1000 * ncpu * (p.ticks - old.ticks) / total) / 10 end
+		end
+	end
+	after.sample_seconds, after.ok = (after.uptime or 0) - (before.uptime or 0), true
+	write(RUN .. '/metrics.json', after)
+	return { ok = true, message = '已采样 5 秒 CPU、进程内存和可用内存。吞吐需由局域网电脑的对照测试工具测量。' }
+end
+
+local function dns_ready()
+	local pid = pidfile('dns')
+	return pid and listening(core.dns_backend_port, false, pid) and true or false
+end
+
+local function dns_result(id, state)
+	local request = assert(decode(RUN .. '/dns-reload.json'), 'DNS 更新请求缺失。')
+	assert(request.id == id and request.engine_pid == system.core_pid(RUN), 'DNS 更新请求已失效。')
+	assert(state == 'done' or state == 'rolled-back' or state == 'failed', '无效 DNS 更新状态。')
+	if state == 'done' then
+		assert(dns_ready(), '新 DNS 后端尚未就绪。')
+		for _,probe in ipairs({{'www.qq.com',false},{'www.google.com',true}}) do
+			local ok,why=system.query(core.dns_backend_port,probe[1],probe[2]); assert(ok,why)
+		end
+		write(RUN .. '/active.json', request.policy)
+	end
+	if state == 'rolled-back' then
+		local old=runtime() or {}
+		write(RUN .. '/dns-selection.json',{domestic_primary=old.domestic_dns,overseas_primary=old.overseas_dns,
+			domestic={active=old.domestic_active or old.domestic_dns,failures=0,successes=0,switched=os.time()},
+			overseas={active=old.overseas_active or old.overseas_dns,failures=0,successes=0,switched=os.time()}})
+		fs.unlink(RUN .. '/reload-needed')
+	end
+	local finished = system.now()
+	write(RUN .. '/dns-switch.json', { id=id,state=state,started=request.started,finished=finished,
+		elapsed_ms=math.floor((finished-request.started)*1000),reason=request.reason,from=request.from,to=request.to,
+		preserved=state ~= 'failed',message=state == 'done' and 'DNS 后端已更新，Xray、DNS 前端和分流集合保持运行。'
+			or state == 'rolled-back' and '新 DNS 后端失败，已恢复原 DNS；Xray 和分流集合保持运行。' or 'DNS 后端及恢复均失败，请查看 DNS 更新日志。' })
+	return {ok=true}
+end
+
+local function dns_reload(reason)
+	local old, candidate = runtime(), decode(RUN .. '/candidate-policy.json')
+	if not core_ready() or not fs.access(RUN .. '/attached') or not transparent.dns_only(old,candidate)
+		or read(RUN .. '/active.nft') ~= read(RUN .. '/candidate.nft')
+		or read(RUN .. '/dnsmasq.conf') ~= read(RUN .. '/candidate-dnsmasq.conf')
+		or not transparent.equal(decode(RUN .. '/xray.json'),decode(RUN .. '/candidate-xray.json')) then return nil end
+	if transparent.equal(decode(RUN .. '/config.json'),decode(RUN .. '/candidate.json')) then
+		write(RUN .. '/active.json',candidate)
+		return {ok=true,dns_only=true,message='运行配置未变，保持现有进程和连接。'}
+	end
+	assert(not fs.access(RUN .. '/dns-reload.request'), '上一次 DNS 更新尚未结束。')
+	local id = os.time() .. '-' .. nixio.getpid()
+	local function selected(c) return {domestic=c.domestic_active or c.domestic_dns,overseas=c.overseas_active or c.overseas_dns,transport=c.transport} end
+	write(RUN .. '/dns-next.json',read(RUN .. '/candidate.json'))
+	write(RUN .. '/dns-reload.json',{id=id,engine_pid=system.core_pid(RUN),started=system.now(),reason=reason,policy=candidate,from=selected(old),to=selected(candidate)})
+	fs.unlink(RUN .. '/dns-reload.response')
+	write(RUN .. '/dns-reload.request',id .. ' ' .. system.core_pid(RUN) .. '\n')
+	for _=1,50 do
+		nixio.nanosleep(1)
+		local response = read(RUN .. '/dns-reload.response')
+		local token,state=response:match('^(%d+%-%d+) ([%w%-]+)')
+		if token == id then
+			assert(state == 'done', state == 'rolled-back' and '新 DNS 启动失败，已恢复原 DNS；业务核心未重启。' or 'DNS 更新失败，请查看 DNS 更新日志。')
+			return {ok=true,dns_only=true,message='DNS 已更新，已有代理连接保持运行。'}
+		end
+		assert(system.core_pid(RUN), 'DNS 更新期间核心已退出。')
+	end
+	error('DNS 更新未在规定时间内完成；请查看 DNS 更新日志与当前运行状态。')
+end
+
+local function apply()
+	if uci:get('flowdns', 'main', 'enabled') ~= '1' then
+		checked('/etc/init.d/flowdns stop', '停止服务失败：')
+		return { ok = true, message = '已退出接管；dnsmasq 配置未被改写。' }
+	end
+	-- Bootstrap only after the selected proxy is configured and duplicate
+	-- interception is disabled. First use should not require a hidden extra step.
+	local c = config()
+	local errors = conflicts()
+	assert(#errors == 0, table.concat(errors, '\n'))
+	if not fs.access(DATA .. '/rules/current/manifest.json') then
+		local ok, why = socks(c.proxy_port, false)
+		assert(ok, why)
+		local job = decode(RUN .. '/job.json') or {}
+		if job.state == 'running' then job.message = '正在首次下载国内规则，请稍候。'; write(RUN .. '/job.json', job) end
+		update_rules()
+	end
+	local job = decode(RUN .. '/job.json') or {}
+	if job.state == 'running' then job.message = '正在检查配置并启动分流服务。'; write(RUN .. '/job.json', job) end
+	prepare() -- A bad candidate never stops an existing service.
+	local partial = dns_reload('保存应用')
+	if partial then return partial end
+	checked('/etc/init.d/flowdns stop', '停止旧服务失败：')
+	activate()
+	checked('FLOWDNS_MODE=prepared /etc/init.d/flowdns start', '启动服务失败：')
+	for _ = 1, core.startup_timeout + 15 do
+		nixio.nanosleep(1)
+		if fs.access(RUN .. '/attached') and running() then return { ok = true, message = '配置已应用，DNS 和连接接管已启动。' } end
+		if read(RUN .. '/state'):match('%S+') == 'failed' then break end
+	end
+	local failure = read(RUN .. '/error')
+	-- Restore the last effective configuration if the new process could not attach.
+	if fs.access(RUN .. '/previous-config.json') then
+		checked('/etc/init.d/flowdns stop', '停止失败配置时出错：')
+		for _, name in ipairs(bundles) do write(RUN .. '/' .. name, read(RUN .. '/previous-' .. name)) end
+		checked('/etc/init.d/flowdns start_recovery', '恢复上一运行配置失败：')
+		error('新配置未能启动，已尝试恢复上一运行配置。请查看概览与日志。' .. failure)
+	end
+	error('新配置未能启动，暂无可恢复的运行配置。请查看日志修正设置后重试。' .. failure)
+end
+
+fs.mkdirr(RUN)
+fs.mkdirr(DATA)
+assert(fs.chmod(RUN, 700), '无法设置 FlowDNS 运行目录权限。')
+local actions = { status = status, prepare = prepare, activate = activate, attach = attach, detach = detach,
+	environment = environment, health = health, metrics = system.metrics, sample = sample,
+	boot = function()
+		assert(os.time() >= 1735689600, '等待系统同步时间，TLS 证书验证需要正确时间。')
+		if not runtime() then local c = config(); devices(c); local ok, why = socks(c.proxy_port, false); assert(ok, why) end
+		if not fs.access(DATA .. '/rules/current/manifest.json') then update_rules() end
+		prepare(runtime() ~= nil); activate(); return { ok = true }
+	end,
+	refresh = function()
+		fs.unlink(RUN .. '/refresh-dns-only')
+		prepare(true)
+		local partial = dns_reload('健康检查或自动维护')
+		if partial then write(RUN .. '/refresh-dns-only','1'); return partial end
+		activate(); return {ok=true}
+	end,
+	dns_ready = function() assert(dns_ready(), 'DNS 后端监听未就绪。'); return {ok=true} end,
+	dns_result = function() return dns_result(arg[2],arg[3]) end,
+	ready = function() assert(core_ready(), '本次核心监听未就绪'); return { ok = true } end,
+	ensure = function()
+		local errors = conflicts()
+		if #errors > 0 then detach(); error(table.concat(errors, '\n')) end
+		if not run('nft -t list table inet flowdns') then return attach() end
+		policy_route(4, true); policy_route(6, true)
+		local c = runtime() or {}
+		if c.mode == 'transparent' then
+			local selected = first('shadowsocksr', 'socks5_proxy')
+			if selected.server ~= c.ssr_node or (fs.stat('/etc/config/shadowsocksr', 'mtime') or 0) ~= c.ssr_revision then write(RUN .. '/reload-needed', os.time()) end
+		end
+		return { ok = true }
+	end,
+	apply = apply, update = update_rules, diagnose = diagnose,
+	rollback = function()
+		local path = fs.realpath(DATA .. '/rules/previous')
+		assert(path and path:match('^/etc/flowdns/rules/v[%d%-]+$'), '没有可回滚的规则版本。')
+		local current = fs.realpath(DATA .. '/rules/current')
+		publish(path, DATA .. '/rules/current')
+		if current then publish(current, DATA .. '/rules/previous') end
+		return { ok = true, message = '已切换到上一规则版本，请保存并应用。' }
+	end,
+	explain = function() return explain(arg[2]) end,
+	stop = function() checked('/etc/init.d/flowdns stop', '停止失败：'); return { ok = true, message = '已退出接管；再次开机会根据启用设置启动。' } end
+}
+
+actions.scheduled = function()
+	local c = config()
+	local previous = decode(DATA .. '/update-state.json') or {}
+	local manifest = decode(DATA .. '/rules/current/manifest.json') or {}
+	if not c.auto_update or c.enabled ~= '1' or os.time() < 1735689600
+		or os.time() - (manifest.updated or 0) < c.update_days * 86400
+		or os.time() - (previous.attempted or 0) < 3600 then return { ok = true, skipped = true } end
+	local state = { attempted = os.time(), state = 'running' }; write(DATA .. '/update-state.json', state)
+	local ok, result = pcall(function()
+		local result = update_rules()
+		write(RUN .. '/reload-needed', os.time())
+		result.message = '自动规则更新成功，监管服务将应用新版本。'
+		return result
+	end)
+	state.state, state.message = ok and 'done' or 'error', ok and result.message or tostring(result)
+	write(DATA .. '/update-state.json', state); write(RUN .. '/update.json', state)
+	assert(ok, state.message)
+	return result
+end
+
+local user_actions = { apply = true, update = true, diagnose = true, rollback = true, stop = true, sample = true, environment = true }
+local locked_actions = { apply = true, update = true, diagnose = true, rollback = true, stop = true, sample = true,
+	boot = true, refresh = true, health = true, scheduled = true, prepare = true, activate = true }
+local lock_busy = false
+local function work_lock(name)
+	local fd = system.lock(RUN .. '/work.lock')
+	if fd then
+		write(RUN .. '/operation.json', { pid = nixio.getpid(), ticks = system.ticks(nixio.getpid()), action = name,
+			started_uptime = tonumber(read('/proc/uptime'):match('^[%d.]+')) })
+	else lock_busy = true end
+	return fd
+end
+local function busy_message()
+	local owner = operation()
+	if not owner then return '另一个操作正在执行，请稍后重试。' end
+	local names = { apply = '配置应用', boot = '开机准备', refresh = '配置刷新', health = '健康检查', scheduled = '定时规则维护',
+		update = '规则更新', diagnose = '完整诊断', sample = '性能采样', prepare = '配置校验', rollback = '规则回滚', stop = '停止接管' }
+	local uptime = tonumber(read('/proc/uptime'):match('^[%d.]+')) or 0
+	local seconds = math.max(0, math.floor(uptime - (owner.started_uptime or uptime)))
+	return ('正在执行%s（PID %s，已运行 %d 秒），请等待完成后重试。'):format(names[owner.action] or owner.action, owner.pid, seconds)
+end
+local function queue(name)
+	assert(user_actions[name], '无效操作。')
+	local queue_lock = assert(system.lock(RUN .. '/queue.lock'), '另一个任务正在提交，请稍后重试。')
+	local active = system.job(RUN)
+	assert(not active or (active.state ~= 'running' and active.state ~= 'queued'), '已有操作正在执行，请等待完成后重试。')
+	local probe = assert(system.lock(RUN .. '/work.lock'), busy_message()); probe:close()
+	local id = os.time() .. '-' .. nixio.getpid()
+	write(RUN .. '/job.json', { state = 'queued', action = name, id = id, started = os.time(), reserved_uptime = tonumber(read('/proc/uptime'):match('^[%d.]+')) })
+	local code = os.execute('/usr/libexec/flowdns job ' .. q(name) .. ' ' .. q(id) .. ' >' .. q(RUN .. '/job-output.log') .. ' 2>&1 </dev/null &')
+	if code ~= 0 then
+		write(RUN .. '/job.json', { state = 'error', id = id, action = name, finished = os.time(), result = { ok = false, message = '无法启动任务进程。' } })
+	end
+	queue_lock:close()
+	return { ok = code == 0, id = id, message = code == 0 and '任务已提交，等待实际执行结果。' or '无法启动任务进程。' }
+end
+
+local ok, result, lock
+if arg[1] == 'job' then
+	local name = arg[2]
+	ok, result = pcall(function()
+		assert(user_actions[name], '无效任务。')
+		lock = assert(work_lock(name), busy_message())
+		local job = assert(decode(RUN .. '/job.json'), '任务预留已失效。')
+		assert(job.id == arg[3] and job.state == 'queued', '任务预留已被替换。')
+		job.state, job.pid, job.ticks = 'running', nixio.getpid(), system.ticks(nixio.getpid())
+		write(RUN .. '/job.json', job)
+		return actions[name]()
+	end)
+	local job = decode(RUN .. '/job.json') or {}
+	if job.id == arg[3] then
+		job.state, job.finished, job.result = ok and result.ok ~= false and 'done' or 'error', os.time(), ok and result or { ok = false, message = tostring(result) }
+		write(RUN .. '/job.json', job)
+	end
+else
+	ok, result = pcall(function()
+		if arg[1] == 'queue' then return queue(arg[2]) end
+		if locked_actions[arg[1]] then
+			lock = work_lock(arg[1])
+			if not lock and (arg[1] == 'health' or arg[1] == 'scheduled') then return { ok = true, skipped = true } end
+			assert(lock, busy_message())
+			local job = system.job(RUN)
+			assert(not job or job.state ~= 'queued', '已有任务等待执行，请稍后重试。')
+		end
+		return assert(actions[arg[1]], '未知命令')()
+	end)
+end
+if lock then fs.unlink(RUN .. '/operation.json'); lock:close() end
+if not ok then
+	result = { ok = false, message = tostring(result), busy = lock_busy or nil }
+	if not lock_busy and ({ prepare = true, boot = true, refresh = true, apply = true, attach = true, ensure = true })[arg[1]] then pcall(write, RUN .. '/error', result.message) end
+end
+print(json.stringify(result or { ok = true }))
+os.exit(ok and 0 or 1)

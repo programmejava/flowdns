@@ -1,0 +1,169 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Use the optional FlowDNS-only engine; keep the system sing-box untouched.
+PATH=/usr/libexec/flowdns-bin:$PATH
+export PATH
+RUN=/var/run/flowdns
+child=
+mode=${1:-boot}
+delay=2
+scheduler=
+record_failure() {
+	# Keep the last failure across successful retries; startup.log is overwritten
+	# by the next core. Bound the record so a crash loop cannot fill RAM.
+	{
+		printf '最近一次核心/接管故障（当前状态以概览为准）\n'
+		date '+%Y-%m-%d %H:%M:%S %z'
+		tail -c 1800 "$RUN/error" 2>/dev/null
+		printf '\n'
+		tail -c 1800 "$RUN/startup.log" 2>/dev/null
+		for file in dnsmasq.log xray.log dns-reload.log; do
+			printf '\n%s\n' "$file"
+			tail -c 1200 "$RUN/$file" 2>/dev/null
+		done
+	} >"$RUN/recovery.log"
+}
+core_exited() {
+	wait "$child"
+	code=$?
+	child=
+	printf '核心进程已退出，退出状态 %s；监管服务将自动重试。\n' "$code" >"$RUN/error"
+	record_failure
+}
+stop_core() {
+	/usr/libexec/flowdns detach >/dev/null 2>&1
+	[ -z "$child" ] || kill "$child" 2>/dev/null
+	[ -z "$child" ] || wait "$child" 2>/dev/null
+	child=
+	rm -f "$RUN/core.pid"
+}
+cleanup() {
+	trap - EXIT TERM INT
+	stop_core
+}
+trap 'echo stopped >"$RUN/state"; cleanup; exit 0' TERM INT
+trap cleanup EXIT
+# Recover a child left behind by an unclean supervisor exit. Only kill a PID
+# whose command line names this service's exact runtime configuration.
+if [ -s "$RUN/core.pid" ]; then
+	previous=$(cat "$RUN/core.pid")
+	case "$previous" in
+		''|*[!0-9]*) ;;
+		*) if [ -r "/proc/$previous/cmdline" ] && tr '\000' '\n' <"/proc/$previous/cmdline" | grep -Fxq "$RUN/config.json"; then
+			kill "$previous" 2>/dev/null
+			# Its engine wrapper must finish cleaning the three child PID files
+			# before a replacement can write them. Never start two groups.
+			attempt=0
+			while kill -0 "$previous" 2>/dev/null && [ "$attempt" -lt 10 ]; do
+				sleep 1; attempt=$((attempt + 1))
+			done
+			if kill -0 "$previous" 2>/dev/null; then
+				printf '上一核心仍在退出，等待监管重试；未启动重复核心。\n' >"$RUN/error"
+				trap - EXIT TERM INT
+				exit 1
+			fi
+		fi ;;
+	esac
+	rm -f "$RUN/core.pid"
+fi
+wait_retry() {
+	echo waiting >"$RUN/state"
+	{ printf '依赖尚未就绪或启动失败，%s 秒后重试。\n' "$delay"; tail -c 1800 "$RUN/error" 2>/dev/null; } >"$RUN/waiting"
+	sleep "$delay"
+	[ "$delay" -ge 60 ] || delay=$((delay * 2))
+	[ "$delay" -le 60 ] || delay=60
+}
+while :; do
+	next_mode=boot
+	attached=0
+	case "$mode" in
+		prepared|recovery|updated) ;;
+		*)
+			/usr/libexec/flowdns "$mode" >"$RUN/prepare-result.json" 2>&1 || { wait_retry; continue; }
+			;;
+	esac
+	echo starting >"$RUN/state"
+	: >"$RUN/waiting"
+	: >"$RUN/error"
+	started=$(date +%s)
+	/usr/libexec/flowdns-engine "$RUN/config.json" >"$RUN/startup.log" 2>&1 &
+	child=$!
+	printf '%s\n' "$child" >"$RUN/core.pid"
+	ready=0
+	attempt=0
+	# Keep aligned with core.startup_timeout.
+	while [ "$attempt" -lt 90 ]; do
+		kill -0 "$child" 2>/dev/null || break
+		if /usr/libexec/flowdns ready >/dev/null 2>&1; then ready=1; break; fi
+		sleep 1
+		attempt=$((attempt + 1))
+	done
+	if [ "$ready" = 1 ] && /usr/libexec/flowdns attach >"$RUN/attach-result.json" 2>&1; then
+		attached=1
+		delay=2
+		echo ready >"$RUN/state"
+		: >"$RUN/error"
+		printf '{"time":%s,"listen_seconds":%s}\n' "$(date +%s)" "$(( $(date +%s) - started ))" >"$RUN/startup-timing.json"
+		health_at=0
+		schedule_at=0
+		while kill -0 "$child" 2>/dev/null; do
+			sleep 5
+			/usr/libexec/flowdns ensure >/dev/null || { record_failure; break; }
+			now=$(date +%s)
+			interval=$(uci -q get flowdns.main.health_interval)
+			case "$interval" in ''|*[!0-9]*) interval=60;; esac
+			[ "$interval" -ge 15 ] && [ "$interval" -le 600 ] || interval=60
+			if [ "$((now - health_at))" -ge "$interval" ]; then
+				/usr/libexec/flowdns health >"$RUN/health-result.json" 2>&1
+				health_at=$now
+			fi
+			if [ "$((now - schedule_at))" -ge 60 ]; then
+				if [ -z "$scheduler" ] || ! kill -0 "$scheduler" 2>/dev/null; then
+					/usr/libexec/flowdns scheduled >"$RUN/schedule-result.json" 2>&1 &
+					scheduler=$!
+				fi
+				schedule_at=$now
+			fi
+			for log in core.log startup.log xray.log dnsmasq.log dns-reload.log; do
+				if [ -f "$RUN/$log" ] && [ "$(wc -c <"$RUN/$log")" -gt 1048576 ]; then
+					# copy/truncate keeps sing-box's open file descriptor working.
+					tail -c 65536 "$RUN/$log" >"$RUN/$log.previous"
+					: >"$RUN/$log"
+				fi
+			done
+			if [ -f "$RUN/reload-needed" ]; then
+				# Validate/activate before stopping the live core. An invalid update
+				# must not turn a working domestic connection into an outage.
+				if /usr/libexec/flowdns refresh >"$RUN/refresh-result.json" 2>&1; then
+					rm -f "$RUN/reload-needed"
+					if [ -f "$RUN/refresh-dns-only" ]; then rm -f "$RUN/refresh-dns-only"; continue; fi
+					next_mode=updated
+					break
+				fi
+			fi
+		done
+		if ! kill -0 "$child" 2>/dev/null; then core_exited; fi
+	else
+		if ! kill -0 "$child" 2>/dev/null; then
+			core_exited
+		else
+			[ -s "$RUN/error" ] || printf '核心未在 90 秒内完成启动或接管。\n' >"$RUN/error"
+			record_failure
+		fi
+	fi
+	stop_core
+	if [ "$next_mode" = updated ]; then
+		mode=updated
+		echo recovering >"$RUN/state"
+	else
+		if [ "$mode" = updated ] && [ "$attached" = 0 ] && [ -s "$RUN/previous-config.json" ]; then
+			for file in config.json active.json active.nft xray.json dnsmasq.conf engine-mode; do
+				if [ -f "$RUN/previous-$file" ]; then cp "$RUN/previous-$file" "$RUN/$file"; else : >"$RUN/$file"; fi
+			done
+			mode=recovery
+		else
+			mode=boot
+		fi
+		wait_retry
+	fi
+done

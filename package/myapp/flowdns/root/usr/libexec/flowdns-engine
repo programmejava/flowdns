@@ -1,0 +1,80 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# One supervised process group; the outer supervisor owns firewall lifecycle.
+# Use the optional FlowDNS-only engine; keep the system sing-box untouched.
+PATH=/usr/libexec/flowdns-bin:$PATH
+export PATH
+RUN=/var/run/flowdns
+config=${1:-$RUN/config.json}
+if [ "$(cat "$RUN/engine-mode" 2>/dev/null)" != transparent ]; then
+	exec sing-box run -c "$config"
+fi
+dns=
+proxy=
+front=
+rm -f "$RUN/dns-reload.request" "$RUN/dns-reload.response"
+cleanup() {
+	trap - EXIT TERM INT
+	for pid in "$front" "$proxy" "$dns"; do [ -z "$pid" ] || kill "$pid" 2>/dev/null; done
+	for pid in "$front" "$proxy" "$dns"; do [ -z "$pid" ] || wait "$pid" 2>/dev/null; done
+	rm -f "$RUN/dns.pid" "$RUN/front.pid" "$RUN/transparent.pid"
+}
+trap 'cleanup; exit 0' TERM INT
+trap cleanup EXIT
+sing-box run -c "$config" &
+dns=$!; printf '%s\n' "$dns" >"$RUN/dns.pid"
+xray run -config "$RUN/xray.json" &
+proxy=$!; printf '%s\n' "$proxy" >"$RUN/transparent.pid"
+/usr/libexec/flowdns-dns --keep-in-foreground --conf-file="$RUN/dnsmasq.conf" &
+front=$!; printf '%s\n' "$front" >"$RUN/front.pid"
+dns_start() {
+	sing-box run -c "$config" &
+	dns=$!; printf '%s\n' "$dns" >"$RUN/dns.pid"
+}
+dns_wait() {
+	attempt=0
+	while [ "$attempt" -lt 15 ]; do
+		kill -0 "$dns" 2>/dev/null && kill -0 "$proxy" 2>/dev/null && kill -0 "$front" 2>/dev/null || return 1
+		/usr/libexec/flowdns dns_ready >/dev/null 2>&1 && return 0
+		sleep 1; attempt=$((attempt+1))
+	done
+	return 1
+}
+dns_reload() {
+	read -r token owner <"$RUN/dns-reload.request"
+	case "$token" in ''|*[!0-9-]*) return 1;; esac
+	[ "$owner" = "$$" ] || return 1
+	cp "$config" "$RUN/dns-old.json" || return 1
+	kill "$dns" 2>/dev/null; wait "$dns" 2>/dev/null
+	if cp "$RUN/dns-next.json" "$config.new" && mv "$config.new" "$config"; then
+		dns_start
+		if dns_wait && /usr/libexec/flowdns dns_result "$token" done >>"$RUN/dns-reload.log" 2>&1; then
+			rm -f "$RUN/dns-reload.request"
+			printf '%s done\n' "$token" >"$RUN/dns-reload.response"
+			return 0
+		fi
+	fi
+	kill "$dns" 2>/dev/null; wait "$dns" 2>/dev/null
+	cp "$RUN/dns-old.json" "$config.new" && mv "$config.new" "$config" || return 1
+	dns_start
+	state=failed
+	dns_wait && state=rolled-back
+	/usr/libexec/flowdns dns_result "$token" "$state" >>"$RUN/dns-reload.log" 2>&1
+	rm -f "$RUN/dns-reload.request"
+	printf '%s %s\n' "$token" "$state" >"$RUN/dns-reload.response"
+	[ "$state" = rolled-back ]
+}
+while :; do
+	if [ -f "$RUN/dns-reload.request" ]; then
+		dns_reload || { printf 'DNS 更新及恢复失败。\n' >&2; exit 1; }
+	fi
+	for item in "dns:$dns" "transparent:$proxy" "front:$front"; do
+		name=${item%%:*}; pid=${item#*:}
+		if ! kill -0 "$pid" 2>/dev/null; then
+			wait "$pid"; code=$?
+			printf 'FlowDNS %s 进程退出，状态 %s。\n' "$name" "$code" >&2
+			exit 1
+		fi
+	done
+	sleep 1
+done

@@ -1,0 +1,47 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-3.0-or-later
+USE_PROCD=1
+START=99
+STOP=10
+EXTRA_COMMANDS="start_recovery"
+EXTRA_HELP="  start_recovery  Start the previous effective configuration"
+
+start_service() {
+	[ "$(uci -q get flowdns.main.enabled)" = 1 ] || return 0
+	mkdir -p /var/run/flowdns
+	chmod 700 /var/run/flowdns
+	echo waiting >/var/run/flowdns/state
+	procd_open_instance main
+	procd_set_param command /usr/libexec/flowdns-run "${FLOWDNS_MODE:-boot}"
+	procd_set_param file /var/run/flowdns/config.json
+	procd_set_param respawn 3600 5 3
+	procd_set_param term_timeout 10
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param limits nofile="65535 65535"
+	procd_close_instance
+}
+
+stop_service() {
+	/usr/libexec/flowdns detach
+}
+
+start_recovery() {
+	FLOWDNS_MODE=recovery
+	start
+}
+
+reload_service() {
+	# LuCI owns commit + explicit apply as one queued task. A reload must not
+	# replace its prepared/recovery instance with a boot waiting on its lock.
+	/usr/libexec/flowdns queue apply
+}
+
+service_triggers() {
+	config_load flowdns
+	local networks network
+	config_get networks main networks lan
+	for network in $networks; do
+		procd_add_interface_trigger "interface.*.up" "$network" /etc/init.d/flowdns reload
+	done
+}

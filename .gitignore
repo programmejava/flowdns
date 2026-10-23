@@ -1,0 +1,22 @@
+# Local builds and generated distributions
+/bin/
+/build_dir/
+/staging_dir/
+/dl/
+/tmp/
+/releases/
+*.ipk
+*.apk
+*.tar.gz
+*.tar.xz
+__pycache__/
+*.py[cod]
+
+# Local credentials and runtime snapshots
+.env
+.env.*
+.auth/
+*.pem
+*.key
+/router-backups/
+/runtime/

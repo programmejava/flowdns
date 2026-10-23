@@ -1,0 +1,51 @@
+#!/usr/bin/lua
+-- SPDX-License-Identifier: GPL-3.0-or-later
+-- rpcd requires every method signature to be a JSON object. luci.jsonc
+-- serializes an empty Lua table as [], which silently drops no-argument
+-- methods such as status. Keep registration independent of runtime modules.
+if arg[1] == 'list' then
+	print('{"status":{},"explain":{"domain":""},"action":{"name":""}}')
+	os.exit(0)
+end
+local has_json, json = pcall(require, 'luci.jsonc')
+if not has_json then
+	print('{"ok":false,"message":"缺少 luci-lib-jsonc，请修复 FlowDNS 软件包依赖。"}')
+	os.exit(0)
+end
+local RUN = '/var/run/flowdns'
+local methods = { status = {}, explain = { domain = 'example.com' }, action = { name = 'diagnose' } }
+local function q(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
+local function reply(value) print(json.stringify(value)) end
+local function command(cmd)
+	local p = io.popen(cmd .. ' 2>&1')
+	if not p then return { ok = false, message = '无法启动诊断进程。' } end
+	local output = p:read('*a')
+	local value = json.parse(output)
+	p:close()
+	if type(value) == 'table' and next(value) ~= nil and #value == 0 then return value end
+	return { ok = false, message = '后端未返回有效结果：' .. output:sub(-2000) .. '\n终端检查命令：/usr/libexec/flowdns status' }
+end
+local function handle()
+	if arg[1] ~= 'call' or not methods[arg[2]] then return { ok = false, message = '无效方法。' } end
+	local args = json.parse(io.read(4096))
+	if type(args) ~= 'table' then return { ok = false, message = '请求格式错误，请刷新页面后重试。' } end
+	if arg[2] == 'status' then
+		return command('/usr/libexec/flowdns status')
+	elseif arg[2] == 'explain' then
+		if type(args.domain) ~= 'string' or #args.domain > 253 then return { ok = false, message = '请输入域名。' } end
+		return command('/usr/libexec/flowdns explain ' .. q(args.domain))
+	end
+	local name = args.name
+	if type(name) ~= 'string' or not ({ apply = true, diagnose = true, update = true, rollback = true, stop = true, sample = true, environment = true })[name] then
+		return { ok = false, message = '无效操作。' }
+	end
+	return command('/usr/libexec/flowdns queue ' .. q(name))
+end
+
+local ok, result = pcall(handle)
+if not ok then
+	result = { ok = false, message = 'FlowDNS 操作失败：' .. tostring(result) }
+	pcall(function() require('nixio').syslog('err', result.message) end)
+end
+
+reply(result)

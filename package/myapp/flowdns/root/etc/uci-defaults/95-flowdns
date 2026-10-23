@@ -1,0 +1,5 @@
+#!/bin/sh
+mkdir -p /etc/flowdns/rules
+chmod 700 /etc/flowdns
+/etc/init.d/flowdns enable
+exit 0

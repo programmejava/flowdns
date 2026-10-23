@@ -1,0 +1,13 @@
+{
+  "luci-app-flowdns": {
+    "description": "Configure FlowDNS and inspect routing decisions",
+    "read": {
+      "uci": ["flowdns"],
+      "ubus": { "luci.flowdns": ["status", "explain"] }
+    },
+    "write": {
+      "uci": ["flowdns"],
+      "ubus": { "luci.flowdns": ["action"], "uci": ["commit"] }
+    }
+  }
+}
