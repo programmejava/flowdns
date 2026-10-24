@@ -2,7 +2,7 @@
 'require view';
 'require poll';
 'require dom';
-'require flowdns.ui_v1 as api';
+'require flowdns.ui_v2 as api';
 
 return view.extend({
 	load: function() { return api.status(); },
@@ -31,6 +31,7 @@ return view.extend({
 				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td' }, _('当前运行模式')), E('td', { 'class': 'td' }, (active.mode || data.mode) === 'transparent' ? _('透明代理（SSR Plus / Xray）') : _('SOCKS / Fake-IP'))]),
 				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td' }, _('核心进程')), E('td', { 'class': 'td' }, data.rpc_error ? _('后端不可用') : data.state === 'waiting' ? _('等待依赖，自动重试') : data.dns_updating ? _('DNS 更新中，代理连接保持') : data.starting ? _('启动中（核心最多等待 90 秒）') : data.state === 'degraded' ? _('运行中，部分链路异常') : data.running ? _('运行中') : data.state === 'failed' ? _('启动或接管失败') : _('未运行'))]),
 				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td' }, _('DNS / 防火墙')), E('td', { 'class': 'td' }, (data.dns_ready ? _('监听就绪') : _('未监听')) + ' / ' + (data.attached ? _('已接管') : _('未接管')))]),
+				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td' }, _('国外出口验证')), E('td', { 'class': 'td' }, data.egress_ready ? _('加密 DNS 及代理出口已验证') : data.running ? _('恢复中，后台快速检查；国内服务保持') : _('等待核心启动'))]),
 				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td' }, _('当前有效出口')), E('td', { 'class': 'td' }, exit)]),
 				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td' }, _('当前有效 DNS')), E('td', { 'class': 'td' }, active.transport ? (active.domestic_active || active.domestic_dns) + ' / ' + (active.overseas_active || active.overseas_dns) + ' · ' + (active.transport === 'tls' ? 'DoT' : 'DoH') : _('尚未应用'))]),
 				E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td' }, _('代理 QUIC')), E('td', { 'class': 'td' }, active.mode === 'transparent' ? (active.quic_effective === 'reject' ? _('提前拒绝 UDP/443，其它 UDP 保持原策略') : _('允许，由节点承载')) : _('由原 SOCKS 出口处理'))]),

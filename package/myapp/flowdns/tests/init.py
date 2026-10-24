@@ -28,6 +28,7 @@ procd_open_instance() { fixture_event open_instance "$@"; }
 procd_close_instance() { fixture_event close_instance "$@"; }
 procd_set_param() { fixture_event param "$@"; }
 procd_add_reload_trigger() { fixture_event reload_trigger "$@"; }
+procd_add_config_trigger() { fixture_event config_trigger "$@"; }
 procd_add_interface_trigger() { fixture_event interface_trigger "$@"; }
 procd_lock() { fixture_event procd_lock; }
 ''')
@@ -82,6 +83,8 @@ procd_lock() { fixture_event procd_lock; }
     assert 'reload_trigger flowdns\n' not in calls
     assert 'interface_trigger interface.*.up lan /etc/init.d/flowdns reload\n' in calls
     assert 'interface_trigger interface.*.up lan2 /etc/init.d/flowdns reload\n' in calls
+    assert 'config_trigger config.change shadowsocksr /usr/libexec/flowdns proxy_changed\n' in calls
+    assert 'config_trigger config.change passwall /usr/libexec/flowdns proxy_changed\n' in calls
     print('PASS: recovery mode and configured LAN interface triggers are submitted correctly')
 
     for mode in ('prepared', 'recovery'):

@@ -4,6 +4,13 @@ local M = {}
 function M.now() local seconds, micros = nixio.gettimeofday(); return seconds + (micros or 0) / 1000000 end
 function M.read(path) return fs.readfile(path) or '' end
 function M.decode(path) return json.parse(M.read(path)) end
+-- Change detector only, not a security hash. Never persist node credentials.
+function M.revision(path)
+	local text, a, b = M.read(path), 5381, 0
+	for i = 1, #text do local c = text:byte(i); a = (a * 33 + c) % 4294967296; b = (b * 65599 + c) % 4294967296 end
+	-- OpenWrt Lua 5.1 can use signed 32-bit lua_Integer on a 64-bit host.
+	return ('%.0f:%.0f:%d'):format(a, b, #text)
+end
 function M.write(path, value)
 	local tmp = path .. '.' .. nixio.getpid() .. '.new'
 	assert(fs.writefile(tmp, type(value) == 'table' and json.stringify(value) or tostring(value)), '无法写入 ' .. path)

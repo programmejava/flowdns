@@ -7,7 +7,7 @@ local nixio = require 'nixio'
 local json = require 'luci.jsonc'
 local function q(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
 local function map(path)
-	return (path:gsub('^/var/run/flowdns', root .. '/run'):gsub('^/etc/flowdns', root .. '/data'))
+	return (path:gsub('^/var/run/flowdns', root .. '/run'):gsub('^/etc/flowdns', root .. '/data'):gsub('^/etc/config', root .. '/router-config'))
 end
 local originals = {}
 for _, name in ipairs({ 'mkdirr', 'mkdir', 'rmdir', 'stat', 'chmod', 'readfile', 'writefile', 'access', 'unlink' }) do
@@ -138,6 +138,7 @@ else
 					if cmd:find(item.ip, 1, true) then provider = id end
 				end
 				assert(provider, 'unknown provider fixture')
+					if fixture.mutate_revision then assert(fs.writefile('/etc/config/shadowsocksr', 'replacement generation')) end
 				if fixture[provider] == false then code, output = 1, 'fixture upstream failure'
 				else
 					local packet = assert(fs.readfile('/var/run/flowdns/probe.query'))
@@ -234,6 +235,11 @@ else
 			elseif cmd:find('sing-box rule-set compile', 1, true) then
 				local dest = assert(cmd:match("%-%-output '([^']+)'")); assert(fs.writefile(dest, 'fixture-srs'))
 			elseif cmd:find('curl ', 1, true) then
+				if cmd:find('/dns-query', 1, true) then
+					local packet = assert(fs.readfile('/var/run/flowdns/probe.query'))
+					assert(fs.writefile('/var/run/flowdns/probe.reply', packet:sub(1, 2) .. '\129\128\0\1\0\1\0\0\0\0' .. packet:sub(13)))
+					return {read=function() return '\nFLOWDNS_EXIT=0\n' end,close=function() return true end}
+				end
 				local name = assert(cmd:match('/([%w]+)%.download'), 'unknown fixture download')
 				local lines = {}
 				local options = json.parse(fs.readfile(root .. '/options.json') or '{}') or {}

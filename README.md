@@ -2,7 +2,9 @@
 
 面向 **OpenWrt / ImmortalWrt、firewall4 / nftables** 的统一 DNS 与连接分流工具，提供 LuCI 界面、运行诊断和故障恢复。
 
-当前服务和界面版本：**1.0.1-r1**。可选私有 sing-box 核心：**1.12.25-r1**。
+当前服务和界面版本：**1.0.2-r1**。可选私有 sing-box 核心：**1.12.25-r1**。
+
+1.0.2 改进启停和节点变更后的出口恢复：快速验证、恢复期加密 DNS 备用探测、后台探测与手动应用排队，以及“监听就绪 / 国外出口验证”分开显示。见[本次发布说明](package/myapp/flowdns/RELEASE-1.0.2.md)。
 
 ## 功能
 
@@ -21,14 +23,16 @@
 RK3568 / NanoPi R5S 使用这三个包：
 
 ```sh
-opkg install ./flowdns-core_1.12.25-r1_aarch64_generic.ipk ./flowdns_1.0.1-r1_aarch64_generic.ipk ./luci-app-flowdns_1.0.1-r1_all.ipk
+opkg install ./flowdns-core_1.12.25-r1_aarch64_generic.ipk ./flowdns_1.0.2-r1_aarch64_generic.ipk ./luci-app-flowdns_1.0.2-r1_all.ipk
 ```
 
 私有核心仅安装到 `/usr/libexec/flowdns-bin/sing-box`，不覆盖其他插件使用的系统核心。`flowdns` 包仍声明系统 `sing-box` 等依赖，需使用目标固件的软件源满足。内核模块必须匹配目标内核，不能强制安装其他固件的模块。
 
-启用前，在代理插件配置独立的本机 NOAUTH SOCKS5，显式选择实际节点；处理 SSR、PassWall、SmartDNS、AdGuardHome 等 DNS / 透明代理接管冲突，确保只有一套服务接管。客户端使用系统 DNS。详细步骤见[安装说明](package/myapp/flowdns/RELEASE-1.0.1.md)和[项目手册](package/myapp/flowdns/README.md)。
+MTK / BPi-R3 Mini 使用 `flowdns_1.0.2-r1_aarch64_cortex-a53.ipk` 和同一份 `luci-app-flowdns_1.0.2-r1_all.ipk`。已有通过实际兼容验证的核心可继续使用，无需为此次优化替换共享核心。
 
-已具备 BPi-R3 Mini 的历史真机验收、主机隔离回归，以及 NanoPi R5S 的安装烟测与用户运行反馈；这些结果不代表所有固件、节点、IPv6 和 UDP 场景均已验收。见[兼容范围](package/myapp/flowdns/COMPATIBILITY.md)和[后续用户反馈](VALIDATION.md)。firewall3 / iptables 和非 OpenWrt 系统需要额外适配。
+启用前，在代理插件配置独立的本机 NOAUTH SOCKS5，显式选择实际节点；处理 SSR、PassWall、SmartDNS、AdGuardHome 等 DNS / 透明代理接管冲突，确保只有一套服务接管。客户端使用系统 DNS。详细步骤见[安装说明](package/myapp/flowdns/RELEASE-1.0.2.md)和[项目手册](package/myapp/flowdns/README.md)。
+
+1.0.2 已完成主机隔离回归及 BPi-R3 Mini / NanoPi R5S 的升级、启停恢复、真实节点切换和 HTTPS/DNS 烟测；这些结果不代表所有固件、节点、IPv6 和 UDP 场景均已验收。见[本次记录](package/myapp/flowdns/diagnostics/2026-10-24-1.0.2-recovery.md)、[兼容范围](package/myapp/flowdns/COMPATIBILITY.md)和[后续用户反馈](VALIDATION.md)。firewall3 / iptables 和非 OpenWrt 系统需要额外适配。
 
 ## 源码与构建
 

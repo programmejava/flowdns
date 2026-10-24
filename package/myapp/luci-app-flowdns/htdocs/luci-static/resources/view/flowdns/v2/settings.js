@@ -6,7 +6,7 @@
 'require poll';
 'require dom';
 'require tools.widgets as widgets';
-'require flowdns.ui_v1 as api';
+'require flowdns.ui_v2 as api';
 
 return view.extend({
 	load: function() { return api.status(); },

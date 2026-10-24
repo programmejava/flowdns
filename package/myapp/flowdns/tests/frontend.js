@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 String.prototype.format = function(...args) { let i = 0; return this.replace(/%s/g, () => args[i++]); };
 const resources = process.argv[2] || 'package/myapp/luci-app-flowdns/htdocs/luci-static/resources';
-const source = fs.readFileSync(path.join(resources, 'flowdns/ui_v1.js'), 'utf8');
+const source = fs.readFileSync(path.join(resources, 'flowdns/ui_v2.js'), 'utf8');
 function E(tag, attrs = {}, content = []) {
 	return { tag, attrs, content, style: { display: /display:none/.test(attrs.style || '') ? 'none' : '' },
 		children: Array.isArray(content) ? content : [], addEventListener() {},
@@ -81,14 +81,16 @@ function close(f) {
 	assert.equal(children[0][0], 'admin/services/flowdns/diagnostics');
 	for (const [, item] of children) {
 		const view = fs.readFileSync(path.join(resources, 'view', item.action.path + '.js'), 'utf8');
-		assert.ok(view.includes("'require flowdns.ui_v1 as api'"));
+		assert.ok(view.includes("'require flowdns.ui_v2 as api'"));
 		assert.ok(!view.includes("'require flowdns as api'"));
 		assert.ok(view.includes('api.feedback()'));
 	}
-	const diagnostic = fs.readFileSync(path.join(resources, 'view/flowdns/v1/diagnostics.js'), 'utf8');
+	const diagnostic = fs.readFileSync(path.join(resources, 'view/flowdns/v2/diagnostics.js'), 'utf8');
 	const page = new Function('view', 'poll', 'dom', 'api', '_', 'E', diagnostic)(
 		{ extend: d => d }, { add() {} }, f.dom, f.api, t => t, E);
 	assert.doesNotThrow(() => page.render({ running: true, dns_ready: true, attached: true }));
+	assert.ok(JSON.stringify(page.render({ running: true, state: 'recovering', egress_ready: false })).includes('恢复中，后台快速检查'));
+	assert.ok(JSON.stringify(page.render({ running: true, state: 'ready', egress_ready: true })).includes('加密 DNS 及代理出口已验证'));
 	assert.ok(JSON.stringify(page.render({ running: true, active: { mode: 'transparent', provider: 'ssrplus', ssr_node: 'fixture-node', proxy_port: 1080 } })).includes('Xray · fixture-node'));
 	assert.ok(!source.includes('showModal') && !source.includes('addNotification') && !diagnostic.includes('showModal'));
 	console.log('PASS: default tab is diagnostics; both views use fresh module paths and status renders without the cached old API');

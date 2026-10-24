@@ -59,6 +59,17 @@ end
 local function runtime()
 	return decode(RUN .. '/active.json')
 end
+local function proxy_revision(c)
+	if c.provider == 'ssrplus' then return system.revision('/etc/config/shadowsocksr') end
+	if c.provider == 'passwall' then return system.revision('/etc/config/passwall') end
+	return 'manual:' .. tostring(c.proxy_port)
+end
+local function recovering(reason)
+	local pending = decode(RUN .. '/egress-recovery.json') or {}
+	if pending.revision == proxy_revision(runtime() or {}) and pending.engine_pid == system.core_pid(RUN) and pending.reason == reason then return end
+	write(RUN .. '/egress-recovery.json', { revision = proxy_revision(runtime() or {}), engine_pid = system.core_pid(RUN), reason = reason, started = system.now() })
+	write(RUN .. '/state', 'recovering')
+end
 local function autostart()
 	return fs.access('/etc/rc.d/S99flowdns') and true or false
 end
@@ -253,6 +264,7 @@ end
 local function prepare(offline)
 	local started = system.now()
 	local c = config()
+	c.proxy_revision = proxy_revision(c)
 	local env = environment()
 	assert(env.ok, env.message)
 	local errors = conflicts()
@@ -374,6 +386,7 @@ local function activate()
 	write(RUN .. '/xray.json', read(RUN .. '/candidate-xray.json'))
 	write(RUN .. '/dnsmasq.conf', read(RUN .. '/candidate-dnsmasq.conf'))
 	write(RUN .. '/engine-mode', (decode(RUN .. '/candidate-policy.json') or {}).mode or 'socks')
+	write(RUN .. '/proxy-observed', proxy_revision(decode(RUN .. '/candidate-policy.json') or {}))
 end
 
 running = function()
@@ -417,9 +430,12 @@ local function status()
 	local rules = decode(DATA .. '/rules/current/manifest.json') or {}
 	local alive = running()
 	local state = read(RUN .. '/state'):match('%S+')
-	local ready = alive and (state == 'ready' or state == 'degraded') and core_ready()
+	local ready = alive and (state == 'ready' or state == 'degraded' or state == 'recovering') and core_ready()
+	local recovery_phase = decode(RUN .. '/egress-recovery.json')
+	local h = decode(RUN .. '/health.json') or {}
+	local egress_ready = ready and not recovery_phase and h.ok == true and h.engine_pid == system.core_pid(RUN) and h.proxy_revision == proxy_revision(runtime() or {})
 	local recovery = tail(RUN .. '/recovery.log', 4000)
-	return { version = '1.0.1', dns_updating = fs.access(RUN .. '/dns-reload.request') and true or false, mode = c.mode or 'socks', enabled = c.enabled == '1', autostart = autostart(), running = ready, starting = alive and (state == 'starting' or state == 'waiting' or state == 'recovering'),
+	return { version = '1.0.2', egress_ready = egress_ready and true or false, recovery_phase = recovery_phase, dns_updating = fs.access(RUN .. '/dns-reload.request') and true or false, mode = c.mode or 'socks', enabled = c.enabled == '1', autostart = autostart(), running = ready, starting = alive and (state == 'starting' or state == 'waiting'),
 		supervised = alive, state = state, dns_ready = alive and listening(core.dns_port),
 		attached = run('nft -t list table inet flowdns') and true or false,
 		active = ready and fs.access(RUN .. '/attached') and runtime() or nil, setup = setup(c, rules), rules_version = rules.version, domain_count = rules.domain_count or 0,
@@ -488,7 +504,7 @@ update_rules = function()
 	return { ok = true, message = '国内规则已更新，请点击“保存并应用”使新规则生效。', version = version, domains = #domains }
 end
 
-dns_probe = function(c, overseas, provider)
+dns_probe = function(c, overseas, provider, fast)
 	local p = core.providers[provider or (overseas and c.overseas_dns or c.domestic_dns)]
 	local domain = overseas and 'www.google.com' or 'www.qq.com'
 	local labels = {}
@@ -498,7 +514,7 @@ dns_probe = function(c, overseas, provider)
 	if c.transport == 'https' then
 		local name = p.https_name or p.name
 		local proxy = overseas and (' --proxy ' .. q('socks5://127.0.0.1:' .. c.proxy_port)) or ' --noproxy "*"'
-		local ok, err = run('curl --fail --silent --show-error --connect-timeout 3 --max-time 8' .. proxy ..
+		local ok, err = run('curl --fail --silent --show-error --connect-timeout 3 --max-time ' .. (fast and '3' or '8') .. proxy ..
 			' --connect-to ' .. q(name .. ':443:' .. p.ip .. ':443') .. ' --header "Content-Type: application/dns-message" --header "Accept: application/dns-message" --data-binary ' .. q('@' .. RUN .. '/probe.query') .. ' --output ' .. q(RUN .. '/probe.reply') .. ' ' .. q('https://' .. name .. '/dns-query'))
 		if not ok then return false, err:sub(-1500) end
 		local reply = read(RUN .. '/probe.reply')
@@ -517,7 +533,7 @@ dns_probe = function(c, overseas, provider)
 	}
 	write(RUN .. '/probe.json', probe)
 	write(RUN .. '/probe.log', '')
-	local pid = tonumber(execute('timeout 12 sing-box run -c ' .. q(RUN .. '/probe.json') .. ' >' .. q(RUN .. '/probe-launch.log') .. ' 2>&1 </dev/null & echo $!'))
+	local pid = tonumber(execute('timeout ' .. (fast and '6' or '12') .. ' sing-box run -c ' .. q(RUN .. '/probe.json') .. ' >' .. q(RUN .. '/probe-launch.log') .. ' 2>&1 </dev/null & echo $!'))
 	if not pid then return false, '无法启动 DoT 检测进程。' end
 	for _ = 1, 10 do
 		if listening(15356) then break end
@@ -526,7 +542,7 @@ dns_probe = function(c, overseas, provider)
 	local sock = nixio.socket('inet', 'dgram')
 	local reply
 	if sock then
-		sock:setopt('socket', 'rcvtimeo', 8)
+		sock:setopt('socket', 'rcvtimeo', fast and 3 or 8)
 		if sock:connect('127.0.0.1', 15356) then sock:send(packet); reply = sock:recv(4096) end
 		sock:close()
 	end
@@ -634,13 +650,16 @@ environment = function()
 	return result
 end
 
-health = function()
+health = function(fast)
 	local c = runtime()
 	if not c then return { ok = false, message = '尚无运行配置。' } end
+	local engine, revision = system.core_pid(RUN), proxy_revision(c)
+	local phase = decode(RUN .. '/egress-recovery.json')
+	fast = fast or phase ~= nil or read(RUN .. '/state'):match('%S+') ~= 'ready'
 	local old = decode(RUN .. '/dns-selection.json') or {}
 	if old.domestic_primary ~= c.domestic_dns or old.overseas_primary ~= c.overseas_dns then old = {} end
 	local selection = { domestic_primary = c.domestic_dns, overseas_primary = c.overseas_dns }
-	local result = { time = os.time(), proxy = socks(c.proxy_port, false), groups = {} }
+	local result = { time = os.time(), engine_pid = engine, proxy_revision = revision, proxy = socks(c.proxy_port, false), groups = {} }
 	local changed, all_ok = false, result.proxy
 	for _, group in ipairs({ 'domestic', 'overseas' }) do
 		local overseas = group == 'overseas'
@@ -648,25 +667,32 @@ health = function()
 		local active = c[group .. '_active'] or primary
 		local started = system.now()
 		local ok, detail = false, 'SOCKS 出口不可用，国外解析保持经代理，不改为直连。'
-		if not overseas or result.proxy then ok, detail = dns_probe(c, overseas, active) end
+		if not overseas or result.proxy then ok, detail = dns_probe(c, overseas, active, fast) end
 		local primary_ok = active == primary and ok
 		local backup_ok = active ~= primary and ok
 		local previous = old[group] or {}
 		if c.dns_failover and (not overseas or result.proxy) then
-			if active ~= primary then primary_ok = dns_probe(c, overseas, primary)
-			elseif not ok and (previous.failures or 0) >= 1 then backup_ok = dns_probe(c, overseas, core.backup(primary)) end
+			if active ~= primary then
+				if not ok or not fast then primary_ok = dns_probe(c, overseas, primary, fast) end
+			elseif not ok and (fast or (previous.failures or 0) >= 1) then backup_ok = dns_probe(c, overseas, core.backup(primary), fast) end
 		end
-		selection[group] = core.dns_health(previous, primary, active, ok, primary_ok, backup_ok, os.time(), c.dns_failover)
+		selection[group] = core.dns_health(previous, primary, active, ok, primary_ok, backup_ok, os.time(), c.dns_failover, fast)
 		changed = changed or selection[group].active ~= active
 		result.groups[group] = { ok = ok, primary = primary, active = active, selected = selection[group].active,
 			detail = detail, elapsed_ms = math.floor((system.now() - started) * 1000), failures = selection[group].failures }
 		all_ok = all_ok and ok
 	end
+	-- A node/core may have changed while an external probe was in flight.
+	-- Never publish its result as readiness for the replacement generation.
+	if system.core_pid(RUN) ~= engine or proxy_revision(c) ~= revision then return { ok = false, stale = true, message = '出口已变化，等待新出口验证。' } end
 	write(RUN .. '/dns-selection.json', selection)
 	result.ok, result.reload = all_ok and true or false, changed
 	result.message = all_ok and '出口和国内外加密 DNS 正常。' or '部分链路异常；国内服务继续运行，国外不自动回退直连。'
 	write(RUN .. '/health.json', result)
-	if running() and fs.access(RUN .. '/attached') then write(RUN .. '/state', all_ok and 'ready' or 'degraded') end
+	if all_ok and not changed then
+		fs.unlink(RUN .. '/egress-recovery.json')
+	elseif not phase then recovering('出口或加密 DNS 恢复中') end
+	if running() and fs.access(RUN .. '/attached') then write(RUN .. '/state', all_ok and not changed and 'ready' or 'recovering') end
 	if changed then write(RUN .. '/reload-needed', os.time()) end
 	return result
 end
@@ -778,7 +804,10 @@ local function apply()
 	checked('FLOWDNS_MODE=prepared /etc/init.d/flowdns start', '启动服务失败：')
 	for _ = 1, core.startup_timeout + 15 do
 		nixio.nanosleep(1)
-		if fs.access(RUN .. '/attached') and running() then return { ok = true, message = '配置已应用，DNS 和连接接管已启动。' } end
+		if fs.access(RUN .. '/attached') and running() then
+			local verified = health(true)
+			return { ok = true, egress_ready = verified.ok and not verified.reload or false, message = verified.ok and not verified.reload and '配置已应用，国外加密 DNS 及代理出口验证通过。' or '核心及接管已启动，国外出口恢复中；后台将快速重试，国内服务保持。' }
+		end
 		if read(RUN .. '/state'):match('%S+') == 'failed' then break end
 	end
 	local failure = read(RUN .. '/error')
@@ -813,15 +842,24 @@ local actions = { status = status, prepare = prepare, activate = activate, attac
 	dns_ready = function() assert(dns_ready(), 'DNS 后端监听未就绪。'); return {ok=true} end,
 	dns_result = function() return dns_result(arg[2],arg[3]) end,
 	ready = function() assert(core_ready(), '本次核心监听未就绪'); return { ok = true } end,
+	proxy_changed = function() write(RUN .. '/proxy-changed', tostring(system.now())); return { ok = true } end,
+	recovering = function() recovering('核心启动，等待国外出口验证'); return { ok = true } end,
 	ensure = function()
 		local errors = conflicts()
 		if #errors > 0 then detach(); error(table.concat(errors, '\n')) end
 		if not run('nft -t list table inet flowdns') then return attach() end
 		policy_route(4, true); policy_route(6, true)
 		local c = runtime() or {}
+		local revision = proxy_revision(c)
+		local observed = read(RUN .. '/proxy-observed')
+		if observed ~= revision or fs.access(RUN .. '/proxy-changed') then
+			write(RUN .. '/proxy-observed', revision)
+			recovering('节点或代理配置变化，等待国外出口验证')
+		end
+		fs.unlink(RUN .. '/proxy-changed')
 		if c.mode == 'transparent' then
 			local selected = first('shadowsocksr', 'socks5_proxy')
-			if selected.server ~= c.ssr_node or (fs.stat('/etc/config/shadowsocksr', 'mtime') or 0) ~= c.ssr_revision then write(RUN .. '/reload-needed', os.time()) end
+			if selected.server ~= c.ssr_node or (c.proxy_revision and revision ~= c.proxy_revision) or (fs.stat('/etc/config/shadowsocksr', 'mtime') or 0) ~= c.ssr_revision then write(RUN .. '/reload-needed', os.time()) end
 		end
 		return { ok = true }
 	end,
@@ -884,9 +922,10 @@ local function queue(name)
 	local queue_lock = assert(system.lock(RUN .. '/queue.lock'), '另一个任务正在提交，请稍后重试。')
 	local active = system.job(RUN)
 	assert(not active or (active.state ~= 'running' and active.state ~= 'queued'), '已有操作正在执行，请等待完成后重试。')
-	local probe = assert(system.lock(RUN .. '/work.lock'), busy_message()); probe:close()
+	local probe = system.lock(RUN .. '/work.lock')
+	if probe then probe:close() else local owner = operation(); assert(owner and owner.action == 'health', busy_message()) end
 	local id = os.time() .. '-' .. nixio.getpid()
-	write(RUN .. '/job.json', { state = 'queued', action = name, id = id, started = os.time(), reserved_uptime = tonumber(read('/proc/uptime'):match('^[%d.]+')) })
+	write(RUN .. '/job.json', { state = 'queued', action = name, id = id, wait_health = not probe, started = os.time(), reserved_uptime = tonumber(read('/proc/uptime'):match('^[%d.]+')) })
 	local code = os.execute('/usr/libexec/flowdns job ' .. q(name) .. ' ' .. q(id) .. ' >' .. q(RUN .. '/job-output.log') .. ' 2>&1 </dev/null &')
 	if code ~= 0 then
 		write(RUN .. '/job.json', { state = 'error', id = id, action = name, finished = os.time(), result = { ok = false, message = '无法启动任务进程。' } })
@@ -900,7 +939,18 @@ if arg[1] == 'job' then
 	local name = arg[2]
 	ok, result = pcall(function()
 		assert(user_actions[name], '无效任务。')
-		lock = assert(work_lock(name), busy_message())
+		local reserved = assert(decode(RUN .. '/job.json'), '任务预留已失效。')
+		assert(reserved.id == arg[3] and reserved.state == 'queued', '任务预留已被替换。')
+		reserved.pid, reserved.ticks = nixio.getpid(), system.ticks(nixio.getpid())
+		write(RUN .. '/job.json', reserved)
+		for _ = 1, 250 do
+			lock = work_lock(name)
+			if lock then lock_busy = false; break end
+			local owner = operation()
+			assert((owner and owner.action == 'health') or (not owner and reserved.wait_health), busy_message())
+			nixio.nanosleep(0, 200000000)
+		end
+		assert(lock, busy_message())
 		local job = assert(decode(RUN .. '/job.json'), '任务预留已失效。')
 		assert(job.id == arg[3] and job.state == 'queued', '任务预留已被替换。')
 		job.state, job.pid, job.ticks = 'running', nixio.getpid(), system.ticks(nixio.getpid())
@@ -920,6 +970,7 @@ else
 			if not lock and (arg[1] == 'health' or arg[1] == 'scheduled') then return { ok = true, skipped = true } end
 			assert(lock, busy_message())
 			local job = system.job(RUN)
+			if job and job.state == 'queued' and arg[1] == 'health' then return { ok = true, skipped = true } end
 			assert(not job or job.state ~= 'queued', '已有任务等待执行，请稍后重试。')
 		end
 		return assert(actions[arg[1]], '未知命令')()

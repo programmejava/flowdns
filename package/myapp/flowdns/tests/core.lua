@@ -54,11 +54,15 @@ local base = {
 	proxy_domains = { 'force-proxy.cn' }, realip_domains = { 'compat.example' }
 }
 local rules = { domains = { 'qq.com', 'force-proxy.cn' } }
-test('DNS cooldown and unhealthy backup never trigger switching', function()
+test('dead active DNS can escape cooldown only with a verified live backup', function()
 	local now = 10000
 	local r = core.dns_health({ failures = 3, switched = now - 20 }, 'google', 'google', false, false, true, now, true)
-	assert(r.active == 'google')
+	assert(r.active == 'cloudflare')
 	r = core.dns_health({ failures = 3 }, 'google', 'google', false, false, false, now, true)
+	assert(r.active == 'google')
+	r = core.dns_health({}, 'google', 'google', false, false, true, now, true, true)
+	assert(r.active == 'cloudflare')
+	r = core.dns_health({}, 'google', 'google', false, false, true, now, true, false)
 	assert(r.active == 'google')
 end)
 test('rule update checks all three datasets and reports differences', function()

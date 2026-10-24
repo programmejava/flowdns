@@ -32,12 +32,14 @@ def metadata(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--service', type=Path, required=True)
+    parser.add_argument('--extra-service', type=Path, action='append', default=[], help='Additional architecture build of the same service version')
     parser.add_argument('--ui', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--core', type=Path, help='Optional private flowdns-core IPK')
     parser.add_argument('--core-source', type=Path, help='Matching upstream source with vendored Go dependencies')
     args = parser.parse_args()
     service, ui, output = args.service.resolve(), args.ui.resolve(), args.output.resolve()
+    extra_services = [p.resolve() for p in args.extra_service]
     if bool(args.core) != bool(args.core_source):
         parser.error('--core and --core-source must be supplied together')
     core = args.core.resolve() if args.core else None
@@ -50,6 +52,13 @@ def main():
         parser.error('output must be an empty directory')
     subprocess.run(['python3', str(PACKAGE / 'tests/release.py'), *package_args], cwd=ROOT, check=True)
     meta = metadata(service)
+    architectures = [meta['Architecture']]
+    for extra in extra_services:
+        extra_meta = metadata(extra)
+        if extra_meta['Version'] != meta['Version'] or extra_meta['Architecture'] in architectures:
+            parser.error('additional services must have the same version and distinct architectures')
+        subprocess.run(['python3', str(PACKAGE / 'tests/release.py'), str(extra), str(ui)], cwd=ROOT, check=True)
+        architectures.append(extra_meta['Architecture'])
     makefile = (PACKAGE / 'Makefile').read_text()
     version = re.search(r'^PKG_VERSION:=(.+)$', makefile, re.M).group(1)
     upstream_name = re.search(r'^PKG_SOURCE:=(.+)$', makefile, re.M).group(1)
@@ -58,7 +67,7 @@ def main():
     if digest(upstream) != upstream_hash:
         raise SystemExit('upstream source hash mismatch')
     output.mkdir(parents=True, exist_ok=True)
-    for source in (service, ui) + ((core,) if core else ()):
+    for source in (service, ui) + tuple(extra_services) + ((core,) if core else ()):
         shutil.copyfile(source, output / source.name)
     prefix = 'flowdns-' + version
     archive = output / (prefix + '-source.tar.gz')
@@ -108,11 +117,11 @@ This is package source, not a complete OpenWrt toolchain or router backup.
                 item.uid = item.gid = 0
                 tar.addfile(item, io.BytesIO(data))
     manifest = {
-        'project': 'FlowDNS', 'version': meta['Version'], 'architecture': meta['Architecture'],
-        'baseline': '1.0.0-r1', 'private_dns': {'version': '2.93', 'source': upstream_name, 'sha256': upstream_hash},
+        'project': 'FlowDNS', 'version': meta['Version'], 'architecture': meta['Architecture'], 'architectures': architectures,
+        'baseline': '1.0.1-r1', 'private_dns': {'version': '2.93', 'source': upstream_name, 'sha256': upstream_hash},
         'licenses': {'flowdns': 'GPL-3.0-or-later', 'private_dns': 'GPL-2.0'},
         'files': {p.name: {'sha256': digest(p), 'bytes': p.stat().st_size} for p in sorted(output.iterdir()) if p.is_file()},
-        'validation': 'See source package COMPATIBILITY.md and diagnostics/2026-10-23-rk3568-install.md; other targets require acceptance.',
+        'validation': 'See COMPATIBILITY.md and diagnostics/2026-10-24-1.0.2-recovery.md in the source package; other targets require acceptance.',
     }
     if core:
         manifest['licenses']['private_core'] = 'GPL-3.0-or-later'

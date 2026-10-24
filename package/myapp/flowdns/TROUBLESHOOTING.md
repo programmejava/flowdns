@@ -121,7 +121,15 @@ uci commit flowdns
 3. 降级使用事先保存的同架构服务/UI包和原配置；先停FlowDNS再`opkg --force-downgrade install`指定旧包。恢复脚本和配置含私密数据，应放权限700目录，不公开归档。
 4. 稳定后再修复和复测，不通过连续重启、删锁、替换DNS或全局清防火墙“碰运气”。
 
-## 性能对照
+## 1.0.2 启停或切节点后等待
+
+先看“国外出口验证”，不要用“核心运行 / 监听就绪”判断国外已经恢复。`recovering` 表示 FlowDNS 保留监听和国内服务、正在验证新出口；`egress_ready` 要求探测结果对应当前核心 PID 与节点配置。通过 SSR/PassWall 页面选择节点并应用，插件自己的 SOCKS 必须实际切换；FlowDNS 不会代替节点插件启动。SOCKS 变化不应导致 FlowDNS 核心 PID 改变，透明模式变化需要更新独立 Xray。
+
+监管约 2 秒检查配置内容，事件可提前唤醒；恢复探测一次结束后约 2 秒再试。网络、代理、TLS 超时或死节点仍会增加等待，不能把“2 秒”理解为任何故障的恢复上限。先分别查看 `/var/run/flowdns/egress-recovery.json`、`health.json` 和 `error`；不要公开完整运行配置或原始浏览日志。后台探测期间用户任务可能短暂排队，不能删除 work.lock 解锁。
+
+如果界面称“出口已验证”但浏览器不通，继续核对系统 DNS、缓存、实际 HTTP 请求与节点线路。`curl --socks5-hostname` 只能验证该出口；路由器本机不经过 LAN 接管。切模式后的旧 Fake-IP、浏览器安全 DNS、网站连接重用都可能使客户端恢复滞后。
+
+## 性能对照方法
 
 同节点、同IP/CDN、有线客户端、同HTTP协议至少多轮下载，分别记录直接SOCKS和LAN路径。结合 `tools/flowdns-benchmark.py`、程序5秒CPU/内存采样及错误计数增长。YouTube connection speed 是播放器下载估算，会受缓存/分片/CDN影响；高低单个数字不能证明宽带限速。大量UDP、SQM、全局offload或MTU修改需另安排受控负载实验，当前发布没有为猜测的ISP QoS批量改这些配置。
 

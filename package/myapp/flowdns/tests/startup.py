@@ -89,6 +89,27 @@ os.execv(real_ip, [real_ip] + args)
             for family in ('-4', '-6'):
                 assert '20260:' not in subprocess.check_output(['ip', family, 'rule', 'show'], text=True)
             print('PASS: actual backend detaches both protocol families')
+            # Exercise the real event/change detector without restarting core.
+            (root / 'router-config').mkdir()
+            nodefile = root / 'router-config/shadowsocksr'
+            nodefile.write_text('node A')
+            (root / 'run/active.json').write_text(json.dumps({'mode':'socks','provider':'ssrplus','proxy_port':1080}))
+            backend('attach'); backend('ensure')
+            (root / 'run/egress-recovery.json').unlink()
+            oldstat = nodefile.stat()
+            nodefile.write_text('node B')
+            os.utime(nodefile, ns=(oldstat.st_atime_ns, oldstat.st_mtime_ns))
+            backend('ensure')
+            assert (root / 'run/egress-recovery.json').exists()
+            assert not (root / 'run/reload-needed').exists()
+            assert int((root / 'run/core.pid').read_text()) == process.pid
+            status = json.loads(backend('status').stdout)
+            assert status['egress_ready'] is False and status['running'] is True
+            (root / 'run/egress-recovery.json').unlink()
+            backend('proxy_changed'); backend('ensure')
+            assert (root / 'run/egress-recovery.json').exists()
+            backend('detach')
+            print('PASS: same-size/same-mtime node edits and explicit events trigger recovery without restarting SOCKS core; listeners alone never imply overseas readiness')
             for family, destination in (('-4', '203.0.113.0/24'), ('-6', '2001:db8::/32')):
                 subprocess.run(['ip', family, 'route', 'add', 'blackhole', destination, 'table', '20260'], check=True)
                 before = subprocess.check_output(['ip', family, '-j', 'route', 'show', 'table', '20260'], text=True)

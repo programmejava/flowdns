@@ -8,11 +8,11 @@
   "admin/services/flowdns/settings": {
     "title": "设置与说明",
     "order": 20,
-    "action": { "type": "view", "path": "flowdns/v1/settings" }
+    "action": { "type": "view", "path": "flowdns/v2/settings" }
   },
   "admin/services/flowdns/diagnostics": {
     "title": "状态与排查",
     "order": 10,
-    "action": { "type": "view", "path": "flowdns/v1/diagnostics" }
+    "action": { "type": "view", "path": "flowdns/v2/diagnostics" }
   }
 }

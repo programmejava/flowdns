@@ -38,6 +38,9 @@ reload_service() {
 }
 
 service_triggers() {
+	# Wake only; do not enqueue an implicit FlowDNS apply/restart on UCI commit.
+	procd_add_config_trigger "config.change" "shadowsocksr" /usr/libexec/flowdns proxy_changed
+	procd_add_config_trigger "config.change" "passwall" /usr/libexec/flowdns proxy_changed
 	config_load flowdns
 	local networks network
 	config_get networks main networks lan

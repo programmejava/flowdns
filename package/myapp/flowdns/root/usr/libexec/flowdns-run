@@ -8,6 +8,8 @@ child=
 mode=${1:-boot}
 delay=2
 scheduler=
+health_worker=
+retry_started=$(date +%s)
 record_failure() {
 	# Keep the last failure across successful retries; startup.log is overwritten
 	# by the next core. Bound the record so a crash loop cannot fill RAM.
@@ -31,6 +33,11 @@ core_exited() {
 	record_failure
 }
 stop_core() {
+	# timeout owns a separate process group and forwards TERM to its probe and
+	# curl children. Reap it before replacing generation-owned runtime files.
+	[ -z "$health_worker" ] || kill "$health_worker" 2>/dev/null
+	[ -z "$health_worker" ] || wait "$health_worker" 2>/dev/null
+	health_worker=
 	/usr/libexec/flowdns detach >/dev/null 2>&1
 	[ -z "$child" ] || kill "$child" 2>/dev/null
 	[ -z "$child" ] || wait "$child" 2>/dev/null
@@ -67,6 +74,9 @@ if [ -s "$RUN/core.pid" ]; then
 	rm -f "$RUN/core.pid"
 fi
 wait_retry() {
+	# Keep dependency recovery responsive for the first 90 seconds, then back
+	# off normally on a persistent configuration/dependency failure.
+	if [ "$(( $(date +%s) - retry_started ))" -lt 90 ] && [ "$delay" -gt 4 ]; then delay=4; fi
 	echo waiting >"$RUN/state"
 	{ printf '依赖尚未就绪或启动失败，%s 秒后重试。\n' "$delay"; tail -c 1800 "$RUN/error" 2>/dev/null; } >"$RUN/waiting"
 	sleep "$delay"
@@ -101,20 +111,26 @@ while :; do
 	if [ "$ready" = 1 ] && /usr/libexec/flowdns attach >"$RUN/attach-result.json" 2>&1; then
 		attached=1
 		delay=2
-		echo ready >"$RUN/state"
+		/usr/libexec/flowdns recovering >/dev/null 2>&1
 		: >"$RUN/error"
 		printf '{"time":%s,"listen_seconds":%s}\n' "$(date +%s)" "$(( $(date +%s) - started ))" >"$RUN/startup-timing.json"
 		health_at=0
+		ensure_at=0
 		schedule_at=0
 		while kill -0 "$child" 2>/dev/null; do
-			sleep 5
-			/usr/libexec/flowdns ensure >/dev/null || { record_failure; break; }
 			now=$(date +%s)
+			if [ "$((now - ensure_at))" -ge 2 ] || [ -f "$RUN/proxy-changed" ]; then
+				/usr/libexec/flowdns ensure >/dev/null || { record_failure; break; }
+				ensure_at=$now
+			fi
 			interval=$(uci -q get flowdns.main.health_interval)
 			case "$interval" in ''|*[!0-9]*) interval=60;; esac
 			[ "$interval" -ge 15 ] && [ "$interval" -le 600 ] || interval=60
-			if [ "$((now - health_at))" -ge "$interval" ]; then
-				/usr/libexec/flowdns health >"$RUN/health-result.json" 2>&1
+			if [ "$(cat "$RUN/state" 2>/dev/null)" != ready ] || [ -f "$RUN/egress-recovery.json" ]; then interval=2; fi
+			if [ -n "$health_worker" ] && ! kill -0 "$health_worker" 2>/dev/null; then wait "$health_worker" 2>/dev/null; health_worker=; fi
+			if [ -z "$health_worker" ] && [ "$((now - health_at))" -ge "$interval" ]; then
+				timeout 45 /usr/libexec/flowdns health >"$RUN/health-result.json" 2>&1 &
+				health_worker=$!
 				health_at=$now
 			fi
 			if [ "$((now - schedule_at))" -ge 60 ]; then
@@ -141,6 +157,7 @@ while :; do
 					break
 				fi
 			fi
+			sleep 1
 		done
 		if ! kill -0 "$child" 2>/dev/null; then core_exited; fi
 	else

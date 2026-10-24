@@ -58,13 +58,15 @@ print(1792500000 + int((r / 'ticks').read_text()) if sys.argv[1] == '+%s' else '
 +if a == 'attach':
 +    if s == 'attach-error': (r / 'error').write_text('fixture route conflict'); sys.exit(1)
 +    (r / 'attached').touch()
++if a == 'recovering': (r / 'state').write_text('recovering')
 +if a == 'ensure':
 +    (r / 'healthy').touch()
 +    if s == 'firewall-loss' and not (r / 'lost').exists():
 +        (r / 'lost').touch(); (r / 'attached').unlink(missing_ok=True)
 +        (r / 'error').write_text('fixture firewall was removed'); sys.exit(1)
 +if a == 'health':
-+    if s == 'degraded': (r / 'state').write_text('degraded')
++    (r / 'state').write_text('ready')
++    if s == 'degraded': (r / 'state').write_text('recovering')
 +    if s == 'proxy-recovery':
 +        p = r / 'healths'; n = int(p.read_text()) + 1 if p.exists() else 1; p.write_text(str(n))
 +        (r / 'state').write_text('degraded' if n < 3 else 'ready')
@@ -107,7 +109,7 @@ print(1792500000 + int((r / 'ticks').read_text()) if sys.argv[1] == '+%s' else '
                     assert not (root / 'attached').exists()
                     print(f'PASS: {scenario} explains failure, detaches and remains alive for retry')
                     break
-                if scenario == 'degraded' and state == 'degraded':
+                if scenario == 'degraded' and state == 'recovering' and 'health\n' in calls:
                     assert starts == 1 and (root / 'attached').exists()
                     print('PASS: failed proxy health preserves the live core and interception for domestic traffic')
                     break

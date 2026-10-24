@@ -274,11 +274,13 @@ end
 
 -- Sticky failover: two failures, a verified backup, and a three-minute
 -- cooldown. Failback requires three healthy primary checks after five minutes.
-function M.dns_health(previous, primary, active, active_ok, primary_ok, backup_ok, now, enabled)
+function M.dns_health(previous, primary, active, active_ok, primary_ok, backup_ok, now, enabled, recovering)
 	local s = { active = active, failures = active_ok and 0 or ((previous.failures or 0) + 1),
 		successes = primary_ok and ((previous.successes or 0) + 1) or 0,
 		switched = previous.switched or 0 }
-	if enabled and now - s.switched >= 180 and s.failures >= 2 then
+	-- A verified live backup must not be blocked by the failback cooldown when
+	-- the active DNS is dead. Recovery uses one failure; steady state uses two.
+	if enabled and not active_ok and s.failures >= (recovering and 1 or 2) then
 		local other = active == primary and M.backup(primary) or primary
 		if (other == primary and primary_ok) or (other ~= primary and backup_ok) then
 			s.active, s.switched, s.failures, s.successes = other, now, 0, 0

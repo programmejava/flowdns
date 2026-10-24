@@ -132,3 +132,21 @@ with tempfile.TemporaryDirectory(prefix='flowdns-rpc-runtime-') as temp:
     time.sleep(.8)
     assert json.loads((root / 'run/job.json').read_text())['state'] == 'done'
     print('PASS: process death releases the kernel lock and stale job is explained; a new task can run')
+    holder_script.write_text(holder_code.replace("action='diagnose'", "action='health'"))
+    holder = subprocess.Popen([lua, str(holder_script), str(root / 'run/work.lock'), str(root / 'run/operation.json')], env=env, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == 'locked'
+        queued = call(root, 'action', {'name': 'sample'})
+        assert queued['ok'] is True, queued
+        time.sleep(.15)
+        assert json.loads((root / 'run/job.json').read_text())['state'] == 'queued'
+        holder.terminate(); holder.wait()
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            job = json.loads((root / 'run/job.json').read_text())
+            if job['state'] == 'done': break
+            time.sleep(.05)
+        assert job['state'] == 'done' and job['id'] == queued['id'], job
+        print('PASS: a user task queues behind an in-flight health probe and executes after its kernel lock is released')
+    finally:
+        if holder.poll() is None: holder.kill(); holder.wait()
